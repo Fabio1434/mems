@@ -28,7 +28,10 @@ topology:
         - ./ai_engine.py:/root/ai_engine.py
       exec:
         - apt-get update
-        - apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic python3 python3-pip iproute2 tcpdump
+        - apt-get install -y bpfcc-tools python3-bpfcc linux-headers-generic python3 python3-pip iproute2 tcpdump
+        # NB: bcc a besoin des headers du noyau HOTE ; si linux-headers-generic
+        # ne correspond pas au kernel de la machine hôte, monter /usr/src et
+        # /lib/modules en bind read-only depuis l'hôte à la place.
         - pip3 install scikit-learn numpy pandas
         # eth1 -> attacker
         - ip addr add 10.0.1.1/30 dev eth1
