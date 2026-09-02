@@ -43,6 +43,14 @@ scripts/
                           mesure CPU et latence, en mode baseline ou protected
   plot_benchmark.py       Génère les graphiques comparatifs (CPU, latence,
                           paquets acceptés/rejetés) à partir des résultats
+  start_protection.sh     Lance ai_engine.py en arrière-plan avec logs + CSV
+  stop_protection.sh      Arrête proprement ai_engine.py (détache le XDP)
+tests/
+  test_ai_engine_logic.py Tests unitaires (pytest) de la logique pure :
+                          conversion IP, calcul pps, détection d'anomalies
+                          -- ne nécessitent PAS bcc/eBPF (module mocké)
+requirements.txt          Dépendances Python (scikit-learn, numpy, pandas,
+                          matplotlib, pytest)
 ```
 
 ## 4. Prérequis
@@ -79,13 +87,41 @@ python3 /root/ai_engine.py --iface eth1
 
 Le script attache le programme XDP sur `eth1` (interface côté attaquant), puis boucle en continu : lecture des stats, entraînement/inférence du modèle, mise à jour de la blacklist.
 
-Pour détacher manuellement le programme XDP :
+**Options utiles :**
+
+| Option | Rôle |
+|---|---|
+| `--iface <if>` | Interface où attacher le programme XDP (obligatoire) |
+| `--ttl <sec>` | Durée avant déblocage automatique d'une IP (défaut : 60s) |
+| `--log-csv <fichier>` | Log détaillé (timestamp, IP, pps, statut blacklist) pour un benchmark précis |
+
+Ou via les scripts pratiques (gèrent le PID, les logs et le CSV automatiquement) :
+
+```bash
+./scripts/start_protection.sh eth1
+./scripts/stop_protection.sh
+```
+
+Pour détacher manuellement le programme XDP en cas de besoin :
 
 ```bash
 ip link set dev eth1 xdp off
 ```
 
-## 7. Lancer les benchmarks
+> **Note sur la blacklist** : une IP blacklistée est automatiquement débloquée après expiration d'un TTL (60s par défaut, configurable via `--ttl`). Cela évite qu'un faux positif de l'IA ne bloque définitivement un client légitime.
+
+## 7. Tests unitaires
+
+La logique métier (conversion IP, calcul du débit, détection d'anomalies) est testable **sans bcc/eBPF** (donc sans machine Linux privilégiée), via un mock du module `bcc` :
+
+```bash
+pip3 install -r requirements.txt
+pytest tests/test_ai_engine_logic.py -v
+```
+
+> **Limitation connue** : avec le paramètre `contamination` par défaut (0.05), le modèle Isolation Forest peut occasionnellement flaguer une IP légitime en même temps qu'un flood massif, si son débit s'écarte un peu de la distribution d'entraînement. Ce paramètre est à calibrer sur un jeu de trafic réel représentatif avant la démonstration finale -- c'est un point à documenter dans le rapport (compromis faux positifs / faux négatifs).
+
+## 8. Lancer les benchmarks
 
 ```bash
 cd scripts/
@@ -104,7 +140,7 @@ Résultats produits dans `scripts/benchmark_results/` :
 - `baseline/` et `protected/` — CSV bruts (CPU, latence, résumé de trafic)
 - `graphs/` — `cpu_comparison.png`, `latency_comparison.png`, `packets_comparison.png`
 
-## 8. Outils de génération de trafic et d'analyse
+## 9. Outils de génération de trafic et d'analyse
 
 | Outil | Usage |
 |---|---|
@@ -115,15 +151,16 @@ Résultats produits dans `scripts/benchmark_results/` :
 | `tcpdump` | Capture de paquets pour validation |
 | `htop` / `perf` | Analyse de charge CPU du routeur |
 
-## 9. Livrables du mémoire
+## 10. Livrables du mémoire
 
 - [x] `xdp_filter.c` — programme noyau eBPF/XDP
-- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps
+- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps (avec TTL et logging CSV)
 - [x] `topology.clab.yaml` — infrastructure de test
-- [ ] Dossier d'évaluation des performances (graphiques comparatifs)
+- [x] Tests unitaires de la logique de détection
+- [ ] Dossier d'évaluation des performances (graphiques comparatifs) — à générer après exécution des benchmarks sur le lab réel
 - [ ] Rapport de mémoire complet (état de l'art, conception, implémentation, résultats)
 - [ ] Démonstration en direct devant le jury
 
-## 10. Auteur
+## 11. Auteur
 
 Fabio — Master 2 Télécommunications & Cybersécurité

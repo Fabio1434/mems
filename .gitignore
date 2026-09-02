@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Résultats de benchmark générés localement (volumineux, régénérables)
+scripts/benchmark_results/
+
+# Logs
+*.log
+
+# Objets BPF compilés localement (si compilation manuelle avec clang)
+*.o
+
+# Environnements virtuels
+.venv/
+venv/
+
+# Fichiers d'éditeur / OS
+.vscode/
+.idea/
+.DS_Store

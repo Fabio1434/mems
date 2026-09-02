@@ -27,6 +27,7 @@ Usage :
 """
 
 import argparse
+import csv
 import time
 import socket
 import struct
@@ -43,6 +44,8 @@ from bcc import BPF
 POLL_INTERVAL_SEC = 2          # fréquence de lecture des BPF Maps
 TRAINING_WINDOW = 30           # nombre d'échantillons avant d'entraîner le modèle
 CONTAMINATION = 0.05           # proportion attendue d'anomalies (5%)
+BLACKLIST_TTL_SEC = 60         # durée avant déblocage automatique d'une IP
+                                # (évite qu'un faux positif reste bloqué indéfiniment)
 BPF_SOURCE_FILE = "xdp_filter.c"
 XDP_FUNC_NAME = "xdp_filter_prog"
 
@@ -94,6 +97,14 @@ class BPFMapInterface:
         key = ip_str_to_key(ip_str, self.blacklist_table.Key)
         leaf = self.blacklist_table.Leaf(1)
         self.blacklist_table[key] = leaf
+
+    def remove_from_blacklist(self, ip_str: str):
+        """Retire une IP de la blacklist (utilisé lors de l'expiration TTL)."""
+        key = ip_str_to_key(ip_str, self.blacklist_table.Key)
+        try:
+            del self.blacklist_table[key]
+        except KeyError:
+            pass
 
     def detach(self):
         self.bpf.remove_xdp(self.iface, 0)
@@ -148,19 +159,35 @@ def compute_pps(prev_stats: dict, curr_stats: dict, elapsed_sec: float) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Moteur IA de détection DDoS (XDP + Isolation Forest)")
     parser.add_argument("--iface", required=True, help="Interface réseau où attacher le programme XDP (ex: eth1)")
+    parser.add_argument(
+        "--log-csv", default=None,
+        help="Chemin d'un fichier CSV où logger chaque cycle (timestamp, ip, pps, blacklisted) "
+             "-- utile pour un benchmark précis (voir scripts/run_benchmark.sh)",
+    )
+    parser.add_argument(
+        "--ttl", type=int, default=BLACKLIST_TTL_SEC,
+        help=f"Durée en secondes avant déblocage automatique d'une IP blacklistée (défaut: {BLACKLIST_TTL_SEC})",
+    )
     args = parser.parse_args()
 
-    log.info("Démarrage du moteur IA de détection d'anomalies sur %s", args.iface)
+    log.info("Démarrage du moteur IA de détection d'anomalies sur %s (TTL blacklist: %ds)", args.iface, args.ttl)
     bpf_maps = BPFMapInterface(args.iface)
     detector = TrafficAnomalyDetector()
 
+    csv_writer, csv_file = None, None
+    if args.log_csv:
+        csv_file = open(args.log_csv, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["timestamp", "ip", "pps", "blacklisted"])
+
     prev_stats = {}
-    already_blacklisted = set()
+    blacklisted_since = {}  # ip_str -> timestamp de mise en blacklist
 
     try:
         while True:
             start = time.time()
 
+            # 1. Lire les stats et calculer le débit par IP
             curr_stats = bpf_maps.read_ip_stats()
             pps = compute_pps(prev_stats, curr_stats, POLL_INTERVAL_SEC)
             prev_stats = curr_stats
@@ -170,16 +197,32 @@ def main():
             if not detector.is_trained and detector.ready_to_train():
                 detector.train()
 
-            if detector.is_trained:
-                anomalous_ips = detector.detect(pps)
-                for ip_str in anomalous_ips:
-                    if ip_str not in already_blacklisted:
-                        log.warning(
-                            "Anomalie détectée : %s (%.1f pps) -> blacklist",
-                            ip_str, pps.get(ip_str, 0.0),
-                        )
-                        bpf_maps.add_to_blacklist(ip_str)
-                        already_blacklisted.add(ip_str)
+            # 2. Détecter les anomalies et blacklister les nouvelles IP
+            anomalous_ips = set(detector.detect(pps)) if detector.is_trained else set()
+            for ip_str in anomalous_ips:
+                if ip_str not in blacklisted_since:
+                    log.warning(
+                        "Anomalie détectée : %s (%.1f pps) -> blacklist (TTL %ds)",
+                        ip_str, pps.get(ip_str, 0.0), args.ttl,
+                    )
+                    bpf_maps.add_to_blacklist(ip_str)
+                    blacklisted_since[ip_str] = start
+
+            # 3. Débloquer automatiquement les IP dont le TTL a expiré
+            expired = [
+                ip for ip, ts in blacklisted_since.items()
+                if start - ts >= args.ttl
+            ]
+            for ip_str in expired:
+                log.info("TTL expiré pour %s -> déblocage automatique", ip_str)
+                bpf_maps.remove_from_blacklist(ip_str)
+                del blacklisted_since[ip_str]
+
+            # 4. Logging CSV optionnel (précis, pour les benchmarks)
+            if csv_writer:
+                for ip_str, val in pps.items():
+                    csv_writer.writerow([start, ip_str, val, ip_str in blacklisted_since])
+                csv_file.flush()
 
             elapsed = time.time() - start
             time.sleep(max(0, POLL_INTERVAL_SEC - elapsed))
@@ -188,6 +231,8 @@ def main():
         log.info("Arrêt demandé (Ctrl+C)")
     finally:
         bpf_maps.detach()
+        if csv_file:
+            csv_file.close()
 
 
 if __name__ == "__main__":
