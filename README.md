@@ -51,6 +51,21 @@ Un botnet qui répartit une attaque sur des milliers d'IP, chacune sous le seuil
 
 > Limitation actuelle assumée : l'alerte d'entropie est journalisée mais ne déclenche pas encore de blocage automatique (bloquer massivement des IP sur la seule base d'un signal agrégé serait risqué pour le trafic légitime). C'est un axe de travail futur explicite pour le rapport : coupler l'alerte d'entropie à un rate-limiting global temporaire plutôt qu'à des DROP individuels.
 
+**c) Ré-entraînement périodique (concept drift)**
+
+Un modèle entraîné une seule fois au démarrage ne s'adapte jamais à l'évolution naturelle du trafic (heures de pointe, nouveaux usages). `ai_engine.py` maintient un historique de features en **fenêtre glissante** par IP (`MAX_HISTORY_PER_IP = 600` échantillons, borné via `collections.deque`) et **ré-entraîne le modèle périodiquement** (`--retrain-interval`, 5 min par défaut) sur cette fenêtre récente plutôt que sur tout l'historique depuis le démarrage.
+
+**d) Détection UDP flood**
+
+En plus du `syn_ratio` (SYN flood), le système calcule un `udp_ratio` par IP (proportion de paquets UDP), directement en lien avec le vecteur d'attaque "SYN/UDP Flood" mentionné dans le cahier des charges initial. Un flood UDP à débit quasi-normal mais avec un `udp_ratio` très atypique est détecté par le modèle multi-dimensionnel (voir `tests/test_ai_engine_logic.py::test_detector_flags_stealthy_udp_flood_via_udp_ratio`).
+
+**e) Dashboard web temps réel**
+
+`ai_engine.py` embarque un serveur HTTP (`http.server`, aucune dépendance externe) exposant :
+- `GET /` — le dashboard (`dashboard/index.html`) : trafic par IP, graphe d'entropie, blacklist en direct, flux d'alertes
+- `GET /api/stats` — un snapshot JSON de l'état courant, rafraîchi côté client toutes les 1.5s
+
+Accessible sur `http://<ip-du-routeur>:8080` (port configurable via `--dashboard-port`, désactivable via `--no-dashboard`). Pensé pour la **démonstration en direct** demandée dans le cahier des charges : l'attaque et son blocage sont visibles en temps réel, sans dépendre de la lecture de logs texte.
 
 ## 3. Structure du dépôt
 
@@ -60,9 +75,13 @@ lab/
                           legit-client, xdp-router, target-server)
 src/
   xdp_filter.c            Programme XDP/eBPF (style BCC), compilé et attaché
-                          dynamiquement par ai_engine.py
-  ai_engine.py             Moteur de détection d'anomalies (Isolation Forest)
-                          + gestion des BPF Maps via bcc
+                          dynamiquement par ai_engine.py -- stats TCP/UDP
+  ai_engine.py             Moteur de détection (Isolation Forest multi-critères,
+                          entropie des IP sources, fenêtre glissante +
+                          ré-entraînement périodique, dashboard web intégré)
+dashboard/
+  index.html               Dashboard temps réel (HTML/JS autonome, Chart.js
+                          via CDN), servi directement par ai_engine.py
 scripts/
   run_benchmark.sh        Génère trafic légitime (iperf3) + attaque (hping3),
                           mesure CPU et latence, en mode baseline ou protected
@@ -118,7 +137,12 @@ Le script attache le programme XDP sur `eth1` (interface côté attaquant), puis
 |---|---|
 | `--iface <if>` | Interface où attacher le programme XDP (obligatoire) |
 | `--ttl <sec>` | Durée avant déblocage automatique d'une IP (défaut : 60s) |
-| `--log-csv <fichier>` | Log détaillé (timestamp, IP, pps, statut blacklist) pour un benchmark précis |
+| `--retrain-interval <sec>` | Intervalle de ré-entraînement périodique du modèle (défaut : 300s) |
+| `--dashboard-port <port>` | Port du dashboard web temps réel (défaut : 8080) |
+| `--no-dashboard` | Désactive le dashboard web |
+| `--log-csv <fichier>` | Log détaillé (timestamp, IP, features, blacklist, entropie) pour un benchmark précis |
+
+Une fois lancé, le dashboard temps réel est accessible sur `http://<ip-du-routeur>:8080` (ou l'IP publiée par Containerlab pour ce conteneur).
 
 Ou via les scripts pratiques (gèrent le PID, les logs et le CSV automatiquement) :
 

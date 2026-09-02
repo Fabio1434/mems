@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Dashboard -- Détection DDoS XDP + IA</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a24; --border: #2a2e3d;
+    --text: #e6e6e6; --muted: #8b8fa3;
+    --danger: #ff5470; --warning: #ffb84d; --info: #4da6ff; --ok: #2ecc71;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; background: var(--bg); color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px 0; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .panel.wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  }
+  .badge.danger { background: rgba(255,84,112,0.15); color: var(--danger); }
+  .badge.warning { background: rgba(255,184,77,0.15); color: var(--warning); }
+  .badge.info { background: rgba(77,166,255,0.15); color: var(--info); }
+  .badge.ok { background: rgba(46,204,113,0.15); color: var(--ok); }
+  .alert-row { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .alert-row .ts { color: var(--muted); font-size: 11px; margin-right: 8px; }
+  canvas { max-height: 220px; }
+  .stat-blocked { color: var(--danger); font-weight: 600; }
+  .empty { color: var(--muted); font-style: italic; padding: 12px 0; }
+  #conn-status { position: fixed; top: 16px; right: 20px; font-size: 12px; }
+  #conn-status.ok { color: var(--ok); } #conn-status.err { color: var(--danger); }
+</style>
+</head>
+<body>
+  <h1>🛡️ Détection DDoS -- eBPF/XDP + Isolation Forest</h1>
+  <div class="subtitle">Mémoire M2 Télécommunications & Cybersécurité -- dashboard temps réel</div>
+  <div id="conn-status">●</div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Trafic par IP (débit paquets/s)</h2>
+      <canvas id="ipChart"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Entropie des IP sources (bits)</h2>
+      <canvas id="entropyChart"></canvas>
+    </div>
+
+    <div class="panel">
+      <h2>IP actuellement bloquées</h2>
+      <table id="blacklistTable">
+        <thead><tr><th>IP</th><th>Expire dans</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="blacklistEmpty">Aucune IP bloquée actuellement.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Trafic détaillé par IP</h2>
+      <table id="ipTable">
+        <thead><tr><th>IP</th><th>pps</th><th>syn_ratio</th><th>udp_ratio</th><th>taille moy.</th><th>statut</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel wide">
+      <h2>Alertes récentes</h2>
+      <div id="alertsList"></div>
+      <div class="empty" id="alertsEmpty">Aucune alerte pour le moment.</div>
+    </div>
+  </div>
+
+<script>
+const API = "/api/stats";
+const ipChart = new Chart(document.getElementById("ipChart"), {
+  type: "bar",
+  data: { labels: [], datasets: [{ label: "pps", data: [], backgroundColor: "#4da6ff" }] },
+  options: { responsive: true, plugins: { legend: { display: false } },
+             scales: { y: { beginAtZero: true, ticks: { color: "#8b8fa3" } },
+                       x: { ticks: { color: "#8b8fa3" } } } }
+});
+
+const entropyChart = new Chart(document.getElementById("entropyChart"), {
+  type: "line",
+  data: { labels: [], datasets: [{ label: "Entropie (bits)", data: [], borderColor: "#2ecc71",
+                                     backgroundColor: "rgba(46,204,113,0.1)", fill: true, tension: 0.3 }] },
+  options: { responsive: true, plugins: { legend: { display: false } },
+             scales: { y: { beginAtZero: true, ticks: { color: "#8b8fa3" } },
+                       x: { display: false } } }
+});
+
+function fmtAgo(ts) {
+  const d = Math.max(0, Math.round(Date.now()/1000 - ts));
+  return d < 60 ? d + "s" : Math.round(d/60) + "min";
+}
+function fmtIn(ts) {
+  const d = Math.max(0, Math.round(ts - Date.now()/1000));
+  return d + "s";
+}
+
+async function refresh() {
+  try {
+    const res = await fetch(API, { cache: "no-store" });
+    const data = await res.json();
+    document.getElementById("conn-status").className = "ok";
+    document.getElementById("conn-status").textContent = "● live";
+
+    // Top IP par pps (max 10)
+    const ips = Object.entries(data.ips || {}).sort((a,b) => b[1].pps - a[1].pps).slice(0, 10);
+    ipChart.data.labels = ips.map(([ip]) => ip);
+    ipChart.data.datasets[0].data = ips.map(([, f]) => f.pps.toFixed(1));
+    ipChart.data.datasets[0].backgroundColor = ips.map(([ip]) => data.blacklist[ip] ? "#ff5470" : "#4da6ff");
+    ipChart.update();
+
+    // Entropie
+    const eh = data.entropy_history || [];
+    entropyChart.data.labels = eh.map(p => "");
+    entropyChart.data.datasets[0].data = eh.map(p => p[1]);
+    entropyChart.update();
+
+    // Table blacklist
+    const blEntries = Object.entries(data.blacklist || {});
+    document.querySelector("#blacklistTable tbody").innerHTML = blEntries.map(([ip, exp]) =>
+      `<tr><td>${ip}</td><td>${fmtIn(exp)}</td></tr>`).join("");
+    document.getElementById("blacklistEmpty").style.display = blEntries.length ? "none" : "block";
+    document.getElementById("blacklistTable").style.display = blEntries.length ? "table" : "none";
+
+    // Table trafic détaillé
+    document.querySelector("#ipTable tbody").innerHTML = ips.map(([ip, f]) => {
+      const blocked = data.blacklist[ip];
+      return `<tr>
+        <td>${ip}</td>
+        <td>${f.pps.toFixed(1)}</td>
+        <td>${f.syn_ratio.toFixed(2)}</td>
+        <td>${f.udp_ratio.toFixed(2)}</td>
+        <td>${f.avg_pkt_size.toFixed(0)} o</td>
+        <td>${blocked ? '<span class="badge danger">bloquée</span>' : '<span class="badge ok">normale</span>'}</td>
+      </tr>`;
+    }).join("");
+
+    // Alertes
+    const alerts = (data.alerts || []).slice().reverse();
+    document.getElementById("alertsList").innerHTML = alerts.map(a =>
+      `<div class="alert-row"><span class="ts">${fmtAgo(a.timestamp)}</span>
+       <span class="badge ${a.level}">${a.level}</span> ${a.message}</div>`).join("");
+    document.getElementById("alertsEmpty").style.display = alerts.length ? "none" : "block";
+
+  } catch (e) {
+    document.getElementById("conn-status").className = "err";
+    document.getElementById("conn-status").textContent = "● déconnecté";
+  }
+}
+
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>

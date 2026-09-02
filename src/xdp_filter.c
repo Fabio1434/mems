@@ -1,8 +1,8 @@
 // xdp_filter.c
 // Programme XDP/eBPF (style BCC) : filtrage à la vitesse de la carte réseau
-// + collecte de métriques MULTI-CRITÈRES par IP source (pas seulement le
-// nombre de paquets), pour permettre à ai_engine.py de détecter des
-// signatures d'attaque plus fines qu'un simple seuil de débit.
+// + collecte de métriques MULTI-CRITÈRES par IP source (TCP ET UDP), pour
+// permettre à ai_engine.py de détecter des signatures d'attaque fines
+// (SYN flood, UDP flood, comportement distribué) au-delà d'un simple débit.
 //
 // Ce fichier est compilé et chargé DYNAMIQUEMENT par ai_engine.py via bcc
 // (BPF(src_file="xdp_filter.c")) -- il n'est PAS compilé à part avec clang.
@@ -15,24 +15,27 @@
 
 // ------------------------------------------------------------------
 // Structure de statistiques par IP source, collectée au niveau noyau.
-// Ces trois compteurs permettent de dériver, côté IA (ai_engine.py) :
-//   - le débit (paquets/seconde)                 -> pps
-//   - le ratio de paquets SYN sans ACK             -> syn_ratio
+// Ces compteurs permettent de dériver, côté IA (ai_engine.py) :
+//   - le débit (paquets/seconde)                   -> pps
+//   - le ratio de paquets SYN sans ACK               -> syn_ratio
 //     (signature typique d'un SYN flood : proche de 1.0)
-//   - la taille moyenne des paquets                -> avg_pkt_size
-//     (un flood UDP/SYN utilise souvent des paquets anormalement petits
-//      et uniformes, contrairement à du trafic applicatif normal)
+//   - le ratio de paquets UDP                        -> udp_ratio
+//     (signature typique d'un UDP flood : proche de 1.0 alors que le
+//      trafic légitime est très majoritairement TCP dans la plupart
+//      des contextes applicatifs)
+//   - la taille moyenne des paquets                  -> avg_pkt_size
 // ------------------------------------------------------------------
 struct ip_stat_t {
     u64 packets;
     u64 bytes;
     u64 syn_count;
+    u64 udp_count;
 };
 
 // ------------------------------------------------------------------
 // BPF Maps (macros BCC) partagées avec l'espace utilisateur
 // ------------------------------------------------------------------
-BPF_HASH(blacklist, u32, u8, 65536);            // IP source -> 1 si bloquée
+BPF_HASH(blacklist, u32, u8, 65536);              // IP source -> 1 si bloquée
 BPF_HASH(ip_stats, u32, struct ip_stat_t, 65536); // IP source -> statistiques
 
 // ------------------------------------------------------------------
@@ -52,9 +55,7 @@ int xdp_filter_prog(struct xdp_md *ctx) {
 
     // 2. Parser l'en-tête IP
     // NB (limitation connue, acceptable pour ce PoC) : on suppose une
-    // en-tête IP sans options (IHL = 5, soit 20 octets). Un paquet avec
-    // options IP sera traité par la pile normale (moins précis mais
-    // sans risque de faux DROP).
+    // en-tête IP sans options (IHL = 5, soit 20 octets).
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
@@ -70,6 +71,8 @@ int xdp_filter_prog(struct xdp_md *ctx) {
 
     // 4. Détecter un paquet TCP SYN (sans ACK) -- signature de SYN flood
     u8 is_syn_only = 0;
+    u8 is_udp = 0;
+
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)ip + sizeof(*ip);
         if ((void *)(tcp + 1) <= data_end) {
@@ -77,6 +80,8 @@ int xdp_filter_prog(struct xdp_md *ctx) {
                 is_syn_only = 1;
             }
         }
+    } else if (ip->protocol == IPPROTO_UDP) {
+        is_udp = 1;
     }
 
     // 5. Mise à jour des statistiques multi-critères par IP source
@@ -87,11 +92,15 @@ int xdp_filter_prog(struct xdp_md *ctx) {
         if (is_syn_only) {
             lock_xadd(&stat->syn_count, 1);
         }
+        if (is_udp) {
+            lock_xadd(&stat->udp_count, 1);
+        }
     } else {
         struct ip_stat_t init_stat = {};
         init_stat.packets = 1;
         init_stat.bytes = pkt_len;
         init_stat.syn_count = is_syn_only ? 1 : 0;
+        init_stat.udp_count = is_udp ? 1 : 0;
         ip_stats.update(&src_ip, &init_stat);
     }
 

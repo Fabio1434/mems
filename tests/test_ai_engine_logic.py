@@ -20,6 +20,7 @@ import socket
 import struct
 import random
 import math
+import time
 import types
 import importlib.util
 from pathlib import Path
@@ -77,10 +78,10 @@ def test_compute_pps_counter_reset_guard():
 # Tests : extraction de features multi-critères
 # ------------------------------------------------------------------
 def test_extract_features_basic():
-    prev = {"1.1.1.1": {"packets": 100, "bytes": 10000, "syn_count": 5}}
+    prev = {"1.1.1.1": {"packets": 100, "bytes": 10000, "syn_count": 5, "udp_count": 0}}
     curr = {
-        "1.1.1.1": {"packets": 300, "bytes": 30000, "syn_count": 10},
-        "9.9.9.9": {"packets": 5000, "bytes": 300000, "syn_count": 4990},
+        "1.1.1.1": {"packets": 300, "bytes": 30000, "syn_count": 10, "udp_count": 0},
+        "9.9.9.9": {"packets": 5000, "bytes": 300000, "syn_count": 4990, "udp_count": 0},
     }
     feats = ai_engine.extract_features(prev, curr, elapsed_sec=2.0)
 
@@ -92,12 +93,24 @@ def test_extract_features_basic():
     assert feats["9.9.9.9"]["syn_ratio"] == pytest.approx(4990 / 5000)
 
 
+def test_extract_features_udp_flood_signature():
+    prev = {"1.1.1.1": {"packets": 100, "bytes": 10000, "syn_count": 0, "udp_count": 0}}
+    curr = {
+        "1.1.1.1": {"packets": 300, "bytes": 30000, "syn_count": 0, "udp_count": 0},
+        "9.9.9.9": {"packets": 5000, "bytes": 200000, "syn_count": 0, "udp_count": 4980},
+    }
+    feats = ai_engine.extract_features(prev, curr, elapsed_sec=2.0)
+    assert feats["9.9.9.9"]["udp_ratio"] == pytest.approx(4980 / 5000)
+    assert feats["1.1.1.1"]["udp_ratio"] == 0.0
+
+
 def test_extract_features_no_packets_no_division_by_zero():
-    prev = {"1.1.1.1": {"packets": 100, "bytes": 1000, "syn_count": 0}}
-    curr = {"1.1.1.1": {"packets": 100, "bytes": 1000, "syn_count": 0}}  # aucun nouveau paquet
+    prev = {"1.1.1.1": {"packets": 100, "bytes": 1000, "syn_count": 0, "udp_count": 0}}
+    curr = {"1.1.1.1": {"packets": 100, "bytes": 1000, "syn_count": 0, "udp_count": 0}}
     feats = ai_engine.extract_features(prev, curr, elapsed_sec=2.0)
     assert feats["1.1.1.1"]["pps"] == 0.0
     assert feats["1.1.1.1"]["syn_ratio"] == 0.0
+    assert feats["1.1.1.1"]["udp_ratio"] == 0.0
     assert feats["1.1.1.1"]["avg_pkt_size"] == 0.0
 
 
@@ -154,14 +167,14 @@ def test_entropy_monitor_no_spike_on_stable_traffic():
 def test_detector_not_trained_before_window():
     det = ai_engine.TrafficAnomalyDetector(contamination=0.1)
     for _ in range(ai_engine.TRAINING_WINDOW - 1):
-        det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "avg_pkt_size": 800}})
+        det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
     assert not det.ready_to_train()
 
 
 def test_detector_trains_at_window_threshold():
     det = ai_engine.TrafficAnomalyDetector(contamination=0.1)
     for _ in range(ai_engine.TRAINING_WINDOW):
-        det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "avg_pkt_size": 800}})
+        det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
     assert det.ready_to_train()
     det.train()
     assert det.is_trained
@@ -175,13 +188,14 @@ def test_detector_flags_volumetric_flood():
         det.update({"1.1.1.1": {
             "pps": 10 + random.random() * 10,
             "syn_ratio": 0.05 + random.random() * 0.1,
+            "udp_ratio": 0.02 + random.random() * 0.05,
             "avg_pkt_size": 750 + random.random() * 100,
         }})
     det.train()
 
     anomalies = det.detect({
-        "1.1.1.1": {"pps": 15, "syn_ratio": 0.1, "avg_pkt_size": 800},
-        "9.9.9.9": {"pps": 50000, "syn_ratio": 0.9, "avg_pkt_size": 60},
+        "1.1.1.1": {"pps": 15, "syn_ratio": 0.1, "udp_ratio": 0.03, "avg_pkt_size": 800},
+        "9.9.9.9": {"pps": 50000, "syn_ratio": 0.9, "udp_ratio": 0.05, "avg_pkt_size": 60},
     })
     assert "9.9.9.9" in anomalies
     assert "1.1.1.1" not in anomalies
@@ -200,16 +214,70 @@ def test_detector_flags_stealthy_syn_flood_via_syn_ratio():
         det.update({"1.1.1.1": {
             "pps": 15 + random.random() * 5,
             "syn_ratio": 0.05 + random.random() * 0.1,
+            "udp_ratio": 0.02 + random.random() * 0.05,
             "avg_pkt_size": 750 + random.random() * 100,
         }})
     det.train()
 
     anomalies = det.detect({
-        "1.1.1.1": {"pps": 16, "syn_ratio": 0.1, "avg_pkt_size": 800},    # normal
-        "9.9.9.9": {"pps": 18, "syn_ratio": 0.98, "avg_pkt_size": 60},    # flood furtif
+        "1.1.1.1": {"pps": 16, "syn_ratio": 0.1, "udp_ratio": 0.03, "avg_pkt_size": 800},   # normal
+        "9.9.9.9": {"pps": 18, "syn_ratio": 0.98, "udp_ratio": 0.0, "avg_pkt_size": 60},    # flood furtif
     })
     assert "9.9.9.9" in anomalies
     assert "1.1.1.1" not in anomalies
+
+
+def test_detector_flags_stealthy_udp_flood_via_udp_ratio():
+    """Un UDP flood à débit quasi-normal mais udp_ratio très atypique doit
+    être détecté -- couverture explicite du vecteur UDP flood mentionné
+    dans le cahier des charges initial (SYN/UDP Flood)."""
+    random.seed(2)
+    det = ai_engine.TrafficAnomalyDetector(contamination=0.05)
+    for _ in range(ai_engine.TRAINING_WINDOW):
+        det.update({"1.1.1.1": {
+            "pps": 15 + random.random() * 5,
+            "syn_ratio": 0.05 + random.random() * 0.1,
+            "udp_ratio": 0.02 + random.random() * 0.05,
+            "avg_pkt_size": 750 + random.random() * 100,
+        }})
+    det.train()
+
+    anomalies = det.detect({
+        "1.1.1.1": {"pps": 16, "syn_ratio": 0.1, "udp_ratio": 0.03, "avg_pkt_size": 800},   # normal
+        "9.9.9.9": {"pps": 20, "syn_ratio": 0.0, "udp_ratio": 0.95, "avg_pkt_size": 70},    # UDP flood
+    })
+    assert "9.9.9.9" in anomalies
+    assert "1.1.1.1" not in anomalies
+
+
+def test_detector_sliding_window_caps_history_per_ip():
+    """La fenêtre glissante ne doit jamais dépasser MAX_HISTORY_PER_IP
+    échantillons par IP (nécessaire pour un ré-entraînement périodique
+    qui reflète le trafic RÉCENT, pas tout l'historique depuis le
+    démarrage)."""
+    det = ai_engine.TrafficAnomalyDetector()
+    for _ in range(ai_engine.MAX_HISTORY_PER_IP + 100):
+        det.update({"1.1.1.1": {"pps": 1, "syn_ratio": 0, "udp_ratio": 0, "avg_pkt_size": 100}})
+    assert len(det.feature_history["1.1.1.1"]) == ai_engine.MAX_HISTORY_PER_IP
+
+
+def test_detector_due_for_retrain_respects_interval():
+    """Le modèle doit être signalé comme dû pour un ré-entraînement
+    seulement après l'intervalle configuré (concept drift)."""
+    det = ai_engine.TrafficAnomalyDetector()
+    for _ in range(ai_engine.TRAINING_WINDOW):
+        det.update({"1.1.1.1": {"pps": 15, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
+    det.train()
+
+    now = det.last_train_time
+    assert not det.due_for_retrain(now, interval_sec=300)
+    assert not det.due_for_retrain(now + 299, interval_sec=300)
+    assert det.due_for_retrain(now + 301, interval_sec=300)
+
+
+def test_detector_not_trained_never_due_for_retrain():
+    det = ai_engine.TrafficAnomalyDetector()
+    assert not det.due_for_retrain(9999999999, interval_sec=300)
 
 
 def test_detector_explain_identifies_most_atypical_feature():
@@ -219,10 +287,11 @@ def test_detector_explain_identifies_most_atypical_feature():
         det.update({"1.1.1.1": {
             "pps": 15 + random.random() * 5,
             "syn_ratio": 0.05 + random.random() * 0.1,
+            "udp_ratio": 0.02 + random.random() * 0.05,
             "avg_pkt_size": 750 + random.random() * 100,
         }})
     det.train()
-    anomalies = det.detect({"9.9.9.9": {"pps": 18, "syn_ratio": 0.98, "avg_pkt_size": 60}})
+    anomalies = det.detect({"9.9.9.9": {"pps": 18, "syn_ratio": 0.98, "udp_ratio": 0.0, "avg_pkt_size": 60}})
     explanation = det.explain("9.9.9.9", anomalies["9.9.9.9"])
     assert "syn_ratio" in explanation
 
@@ -230,6 +299,52 @@ def test_detector_explain_identifies_most_atypical_feature():
 def test_detector_empty_input_returns_no_anomalies():
     det = ai_engine.TrafficAnomalyDetector()
     assert det.detect({}) == {}
+
+
+# ------------------------------------------------------------------
+# Tests : dashboard temps réel (serveur HTTP réel, sur localhost)
+# ------------------------------------------------------------------
+def test_dashboard_state_snapshot_reflects_updates():
+    state = ai_engine.DashboardState()
+    state.record_cycle(
+        {"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}},
+        entropy=2.3,
+        blacklisted_since={"9.9.9.9": time.time()},
+        ttl=60,
+    )
+    state.add_alert("danger", "test alert")
+    snap = state.snapshot()
+    assert "1.1.1.1" in snap["ips"]
+    assert "9.9.9.9" in snap["blacklist"]
+    assert len(snap["alerts"]) == 1
+
+
+def test_dashboard_http_server_serves_api_and_static_page():
+    """Démarre un vrai serveur HTTP local et vérifie que l'API JSON et la
+    page HTML du dashboard répondent correctement -- pas seulement un test
+    de logique, un vrai aller-retour réseau sur localhost."""
+    import urllib.request
+    import json as json_module
+
+    state = ai_engine.DashboardState()
+    state.record_cycle(
+        {"1.1.1.1": {"pps": 10.0, "syn_ratio": 0.05, "udp_ratio": 0.01, "avg_pkt_size": 700}},
+        entropy=1.5, blacklisted_since={}, ttl=60,
+    )
+    server = ai_engine.start_dashboard_server(state, port=0)
+    port = server.server_address[1]
+    time.sleep(0.2)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=2) as resp:
+            data = json_module.loads(resp.read())
+        assert "1.1.1.1" in data["ips"]
+        assert data["feature_names"] == ai_engine.FEATURE_NAMES
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as resp:
+            html = resp.read().decode()
+        assert "Dashboard" in html or "dashboard" in html.lower()
+    finally:
+        server.shutdown()
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "[*] Protection active (PID $(cat "$PID_FILE"))."
     echo "    Logs   : $LOG_FILE"
     echo "    Métriques CSV : $CSV_FILE"
+    echo "    Dashboard temps réel : http://<ip-de-ce-conteneur>:8080"
 else
     echo "[!] Échec du démarrage -- voir $LOG_FILE"
     cat "$LOG_FILE"
