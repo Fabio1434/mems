@@ -1,0 +1,57 @@
+name: xdp-ai-lab
+
+topology:
+  nodes:
+    attacker:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.1.2/30 dev eth1
+        - ip link set eth1 up
+        - ip route del default
+        - ip route add default via 10.0.1.1
+
+    legit-client:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.2.2/30 dev eth1
+        - ip link set eth1 up
+        - ip route del default
+        - ip route add default via 10.0.2.1
+
+    xdp-router:
+      kind: linux
+      image: ubuntu:24.04
+      binds:
+        - ./xdp_filter.c:/root/xdp_filter.c
+        - ./ai_engine.py:/root/ai_engine.py
+      exec:
+        - apt-get update
+        - apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic python3 python3-pip iproute2 tcpdump
+        - pip3 install scikit-learn numpy pandas
+        # eth1 -> attacker
+        - ip addr add 10.0.1.1/30 dev eth1
+        - ip link set eth1 up
+        # eth2 -> legit-client
+        - ip addr add 10.0.2.1/30 dev eth2
+        - ip link set eth2 up
+        # eth3 -> target-server
+        - ip addr add 10.0.3.1/30 dev eth3
+        - ip link set eth3 up
+        # activer le forwarding IP (le routeur doit relayer le trafic)
+        - sysctl -w net.ipv4.ip_forward=1
+
+    target-server:
+      kind: linux
+      image: ghcr.io/hellt/network-multitool
+      exec:
+        - ip addr add 10.0.3.2/30 dev eth1
+        - ip link set eth1 up
+        - ip route del default
+        - ip route add default via 10.0.3.1
+
+  links:
+    - endpoints: ["attacker:eth1", "xdp-router:eth1"]
+    - endpoints: ["legit-client:eth1", "xdp-router:eth2"]
+    - endpoints: ["xdp-router:eth3", "target-server:eth1"]
