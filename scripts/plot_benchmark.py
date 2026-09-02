@@ -135,11 +135,52 @@ def plot_packets():
     plt.close()
 
 
+def plot_entropy():
+    """Trace l'entropie des IP sources au fil du temps, si ai_engine.py a été
+    lancé avec --log-csv (colonne source_entropy). Une hausse brusque signale
+    une attaque distribuée (voir README, section détection multi-critères)."""
+    plt.figure(figsize=(9, 5))
+    plotted = False
+    for mode in MODES:
+        path = os.path.join(RESULTS_DIR, mode, "ai_engine_metrics.csv")
+        if not os.path.exists(path):
+            continue
+        timestamps, entropies = [], []
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            t0 = None
+            seen = set()
+            for row in reader:
+                t = float(row["timestamp"])
+                if t0 is None:
+                    t0 = t
+                if t in seen:
+                    continue
+                seen.add(t)
+                timestamps.append(t - t0)
+                entropies.append(float(row["source_entropy"]))
+        if timestamps:
+            plt.plot(timestamps, entropies, label=mode, color=COLORS[mode])
+            plotted = True
+
+    if not plotted:
+        return
+    plt.xlabel("Temps écoulé (s)")
+    plt.ylabel("Entropie des IP sources (bits)")
+    plt.title("Entropie des IP sources : baseline vs protected")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(GRAPH_DIR, "entropy_comparison.png"), dpi=150)
+    plt.close()
+
+
 def main():
     os.makedirs(GRAPH_DIR, exist_ok=True)
     plot_cpu()
     plot_latency()
     plot_packets()
+    plot_entropy()
     print(f"Graphiques générés dans {GRAPH_DIR}/")
 
 

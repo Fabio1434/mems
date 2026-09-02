@@ -42,9 +42,9 @@ echo "=== Benchmark en mode : $MODE ==="
 # 1. (Re)démarrer ai_engine.py sur le routeur si mode = protected
 # ------------------------------------------------------------------
 if [[ "$MODE" == "protected" ]]; then
-    echo "[*] Démarrage de ai_engine.py (XDP + IA) sur le routeur..."
+    echo "[*] Démarrage de ai_engine.py (XDP + IA multi-critères) sur le routeur..."
     docker exec -d "$ROUTER" bash -c \
-        "pkill -f ai_engine.py || true; sleep 1; python3 /root/ai_engine.py --iface eth1 > /root/ai_engine.log 2>&1 &"
+        "pkill -f ai_engine.py || true; sleep 1; python3 /root/ai_engine.py --iface eth1 --log-csv /root/ai_engine_metrics.csv > /root/ai_engine.log 2>&1 &"
     sleep 3  # laisser le temps au programme XDP de s'attacher
 else
     echo "[*] Mode baseline : on s'assure que ai_engine.py n'est PAS actif."
@@ -126,6 +126,14 @@ SENT_COUNT=$(grep -oE "[0-9]+ packets transmitted" "$OUT_DIR/hping3_attacker.log
 echo "sample,latency_ms" > "$OUT_DIR/latency.csv"
 awk '{print NR","$0}' "$OUT_DIR/latency_raw.txt" >> "$OUT_DIR/latency.csv"
 rm -f "$OUT_DIR/latency_raw.txt"
+
+# ------------------------------------------------------------------
+# 9. Récupérer les métriques précises de ai_engine.py (mode protected)
+# ------------------------------------------------------------------
+if [[ "$MODE" == "protected" ]]; then
+    docker cp "${ROUTER}:/root/ai_engine_metrics.csv" "$OUT_DIR/ai_engine_metrics.csv" 2>/dev/null || \
+        echo "[!] Impossible de récupérer ai_engine_metrics.csv (le fichier existe-t-il sur le routeur ?)"
+fi
 
 echo "=== Benchmark '$MODE' terminé. Résultats dans $OUT_DIR/ ==="
 cat "$OUT_DIR/traffic_summary.txt"

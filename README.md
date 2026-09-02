@@ -18,14 +18,39 @@ Ce projet propose une architecture hybride qui filtre le trafic **à la vitesse 
                     │   │                          │
                     │   ├─ BPF Map "blacklist"      │◄── écrite par ai_engine.py
                     │   ├─ BPF Map "ip_stats"        │──► lue par ai_engine.py
-                    │   │                          │
+                    │   │  (packets, bytes, syn_count) │
   [legit-client] ─eth2─┤ eth2                        │
                     │   eth3 ──────────────────────┼──eth1── [target-server]
                     └─────────────────────────────┘
 ```
 
-- **Espace noyau (Kernel Space)** — `xdp_filter.c` : inspecte chaque paquet dès son arrivée sur l'interface, consulte la BPF Map `blacklist` (DROP immédiat si l'IP source y figure), et incrémente les compteurs par IP dans `ip_stats`.
-- **Espace utilisateur (User Space)** — `ai_engine.py` : lit `ip_stats` périodiquement, calcule le débit (paquets/seconde) par IP, entraîne un modèle `IsolationForest` (scikit-learn), et inscrit les IP anormales dans `blacklist`.
+- **Espace noyau (Kernel Space)** — `xdp_filter.c` : inspecte chaque paquet dès son arrivée sur l'interface, consulte la BPF Map `blacklist` (DROP immédiat si l'IP source y figure), et met à jour des statistiques **multi-critères** par IP dans `ip_stats` (nombre de paquets, octets totaux, paquets SYN-sans-ACK).
+- **Espace utilisateur (User Space)** — `ai_engine.py` : lit `ip_stats` périodiquement, dérive 3 features par IP (débit, ratio de SYN, taille moyenne de paquet), entraîne un modèle `IsolationForest` multi-dimensionnel, calcule l'entropie de Shannon de la répartition du trafic entre IP sources, et inscrit les IP anormales dans `blacklist` (avec expiration automatique après un TTL configurable).
+
+## 3. Détection multi-critères : ce qui rend le système robuste
+
+Une détection basée sur le seul débit (paquets/seconde) manque deux catégories d'attaques réalistes. Ce projet y répond par deux mécanismes complémentaires :
+
+**a) Détection multi-dimensionnelle par IP (`ai_engine.py::TrafficAnomalyDetector`)**
+
+Le modèle Isolation Forest est entraîné sur 3 features simultanément :
+- `pps` — débit brut
+- `syn_ratio` — proportion de paquets SYN-sans-ACK (signature de SYN flood)
+- `avg_pkt_size` — taille moyenne des paquets
+
+Une IP au débit quasi-normal mais au `syn_ratio` très élevé (SYN flood "furtif", conçu pour rester sous un seuil de débit classique) est tout de même détectée — voir `tests/test_ai_engine_logic.py::test_detector_flags_stealthy_syn_flood_via_syn_ratio`.
+
+Chaque blocage est journalisé avec la feature la plus atypique par rapport à la moyenne du trafic normal (`TrafficAnomalyDetector.explain()`), ce qui donne une **justification exploitable en soutenance** ("pourquoi cette IP a-t-elle été bloquée ?").
+
+**b) Détection d'attaques distribuées par entropie des IP sources (`ai_engine.py::EntropyMonitor`)**
+
+Un botnet qui répartit une attaque sur des milliers d'IP, chacune sous le seuil de détection individuel, échappe à la détection par IP. Le système calcule à chaque cycle l'**entropie de Shannon** de la répartition du trafic entre sources :
+
+- Entropie proche de 0 → trafic concentré sur peu d'IP (flood classique, déjà couvert par la détection par IP).
+- **Hausse brusque de l'entropie** au-dessus de la moyenne mobile récente → le trafic se répartit soudain sur beaucoup plus de sources qu'à l'habitude, signature typique d'une attaque distribuée. Une alerte est journalisée (et disponible dans le CSV de métriques pour analyse a posteriori).
+
+> Limitation actuelle assumée : l'alerte d'entropie est journalisée mais ne déclenche pas encore de blocage automatique (bloquer massivement des IP sur la seule base d'un signal agrégé serait risqué pour le trafic légitime). C'est un axe de travail futur explicite pour le rapport : coupler l'alerte d'entropie à un rate-limiting global temporaire plutôt qu'à des DROP individuels.
+
 
 ## 3. Structure du dépôt
 
@@ -109,6 +134,8 @@ ip link set dev eth1 xdp off
 ```
 
 > **Note sur la blacklist** : une IP blacklistée est automatiquement débloquée après expiration d'un TTL (60s par défaut, configurable via `--ttl`). Cela évite qu'un faux positif de l'IA ne bloque définitivement un client légitime.
+
+> **Note sur `TRAINING_WINDOW`** : fixé empiriquement à 150 échantillons (voir tests). Avec un historique d'entraînement trop court (testé à 30), l'Isolation Forest manque de données pour bien séparer les anomalies subtiles (SYN flood furtif à débit quasi-normal) -- un point à documenter dans le rapport si vous ajustez cette valeur.
 
 ## 7. Tests unitaires
 
