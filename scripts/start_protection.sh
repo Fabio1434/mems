@@ -5,14 +5,19 @@
 # xdp-router (ou sur toute machine où bcc est installé).
 #
 # Usage :
-#   ./start_protection.sh [interface]   (défaut: eth1)
+#   ./start_protection.sh [fichier-config.yaml] [interface]
+#
+#   Si un fichier de config est fourni, l'interface qu'il contient est
+#   utilisée sauf si explicitement précisée en second argument.
+#   Sans fichier de config : ./start_protection.sh "" eth1
 #
 # Arrêt :
 #   ./stop_protection.sh
 
 set -euo pipefail
 
-IFACE="${1:-eth1}"
+CONFIG_FILE="${1:-}"
+IFACE="${2:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AI_ENGINE="$SCRIPT_DIR/../src/ai_engine.py"
 LOG_FILE="/root/ai_engine.log"
@@ -24,9 +29,21 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     exit 0
 fi
 
-echo "[*] Démarrage de ai_engine.py sur l'interface $IFACE..."
-nohup python3 "$AI_ENGINE" --iface "$IFACE" --log-csv "$CSV_FILE" \
-    > "$LOG_FILE" 2>&1 &
+ARGS=(--log-csv "$CSV_FILE")
+if [[ -n "$CONFIG_FILE" ]]; then
+    ARGS+=(--config "$CONFIG_FILE")
+    echo "[*] Démarrage de ai_engine.py avec la config $CONFIG_FILE..."
+else
+    if [[ -z "$IFACE" ]]; then
+        echo "Usage: $0 [fichier-config.yaml] [interface]"
+        echo "  (au moins l'un des deux doit être fourni)"
+        exit 1
+    fi
+    ARGS+=(--iface "$IFACE")
+    echo "[*] Démarrage de ai_engine.py sur l'interface $IFACE (sans fichier de config)..."
+fi
+
+nohup python3 "$AI_ENGINE" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
 
 echo $! > "$PID_FILE"
 sleep 2
@@ -36,6 +53,9 @@ if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "    Logs   : $LOG_FILE"
     echo "    Métriques CSV : $CSV_FILE"
     echo "    Dashboard temps réel : http://<ip-de-ce-conteneur>:8080"
+    if [[ -n "$CONFIG_FILE" ]] && grep -q "dry_run: *true" "$CONFIG_FILE" 2>/dev/null; then
+        echo "    ⚠️  MODE SIMULATION ACTIF (dry_run: true dans $CONFIG_FILE) -- aucun blocage réel."
+    fi
 else
     echo "[!] Échec du démarrage -- voir $LOG_FILE"
     cat "$LOG_FILE"

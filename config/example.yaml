@@ -1,0 +1,68 @@
+# config.yaml -- Configuration de déploiement pour ai_engine.py
+#
+# Copier ce fichier vers config/config.yaml (ou tout autre nom) et
+# l'adapter à l'environnement testé. Chaque réseau (lab, réseau de test,
+# environnement client) devrait avoir SON PROPRE fichier de config plutôt
+# que de modifier le code.
+#
+# Usage :
+#   sudo python3 ai_engine.py --config config/config.yaml
+
+# Interface réseau où attacher le programme XDP.
+# Peut être surchargée en ligne de commande avec --iface.
+interface: eth1
+
+detection:
+  # Proportion attendue d'anomalies dans le trafic (paramètre du modèle
+  # Isolation Forest). Une valeur plus basse = détection plus stricte,
+  # plus de faux négatifs possibles. Une valeur plus haute = détection
+  # plus permissive, plus de faux positifs possibles.
+  contamination: 0.05
+
+  # Nombre minimum d'échantillons avant le premier entraînement du modèle.
+  # Valeur empirique -- voir tests/test_ai_engine_logic.py et le README
+  # pour la justification (30 est insuffisant pour séparer des anomalies
+  # subtiles, 150 fonctionne de façon fiable).
+  training_window: 150
+
+  # Taille de la fenêtre glissante d'historique par IP (nombre
+  # d'échantillons conservés pour le ré-entraînement périodique).
+  max_history_per_ip: 600
+
+  # Intervalle (en secondes) entre deux ré-entraînements automatiques du
+  # modèle, pour s'adapter à l'évolution du trafic (concept drift).
+  retrain_interval_sec: 300
+
+  # Fréquence (en secondes) de lecture des BPF Maps.
+  poll_interval_sec: 2
+
+blacklist:
+  # Durée (en secondes) avant déblocage automatique d'une IP blacklistée.
+  ttl_sec: 60
+
+  # MODE SIMULATION (recommandé pour un premier test sur un nouveau
+  # réseau) : si true, le système DÉTECTE et JOURNALISE les anomalies
+  # mais NE BLOQUE JAMAIS réellement de trafic. À utiliser pour calibrer
+  # les seuils et vérifier le taux de faux positifs avant d'activer le
+  # blocage réel (dry_run: false).
+  dry_run: true
+
+  # Liste blanche : IP JAMAIS bloquées, même si le modèle les juge
+  # anormales. À utiliser IMPÉRATIVEMENT pour la passerelle réseau, les
+  # serveurs DNS, les sondes de supervision, ou toute IP dont le blocage
+  # aurait un impact critique. C'est un filet de sécurité, pas une
+  # option secondaire.
+  whitelist:
+    - 10.0.2.1   # exemple : passerelle interne du lab
+    - 10.0.3.1   # exemple : autre IP critique
+
+entropy:
+  # Nombre de cycles conservés pour la moyenne mobile d'entropie.
+  history_size: 15
+  # Écart (en bits) au-dessus de la moyenne mobile déclenchant une alerte
+  # d'attaque distribuée.
+  spike_threshold: 0.35
+
+dashboard:
+  enabled: true
+  port: 8080

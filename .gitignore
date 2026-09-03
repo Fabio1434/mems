@@ -7,6 +7,11 @@ __pycache__/
 # Résultats de benchmark générés localement (volumineux, régénérables)
 scripts/benchmark_results/
 
+# Fichiers de configuration spécifiques à un déploiement (garder uniquement
+# le modèle versionné, config/example.yaml)
+config/*.yaml
+!config/example.yaml
+
 # Logs
 *.log
 

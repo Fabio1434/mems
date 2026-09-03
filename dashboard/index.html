@@ -49,6 +49,9 @@
   <h1>🛡️ Détection DDoS -- eBPF/XDP + Isolation Forest</h1>
   <div class="subtitle">Mémoire M2 Télécommunications & Cybersécurité -- dashboard temps réel</div>
   <div id="conn-status">●</div>
+  <div id="dryRunBanner" style="display:none; background: rgba(255,184,77,0.15); color: #ffb84d; border: 1px solid #ffb84d; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; font-weight: 600;">
+    ⚠️ MODE SIMULATION ACTIF -- aucun blocage réel n'est appliqué. Les IP ci-dessous "seraient" bloquées.
+  </div>
 
   <div class="grid">
     <div class="panel">
@@ -67,6 +70,15 @@
         <tbody></tbody>
       </table>
       <div class="empty" id="blacklistEmpty">Aucune IP bloquée actuellement.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Liste blanche (jamais bloquées)</h2>
+      <table id="whitelistTable">
+        <thead><tr><th>IP</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="whitelistEmpty">Aucune IP en liste blanche.</div>
     </div>
 
     <div class="panel">
@@ -118,12 +130,17 @@ async function refresh() {
     const data = await res.json();
     document.getElementById("conn-status").className = "ok";
     document.getElementById("conn-status").textContent = "● live";
+    document.getElementById("dryRunBanner").style.display = data.dry_run ? "block" : "none";
+
+    // En mode dry-run, on affiche la blacklist SIMULÉE dans le même panneau
+    // (avec un intitulé différent côté données) pour rester visible.
+    const effectiveBlacklist = data.dry_run ? (data.simulated_blacklist || {}) : (data.blacklist || {});
 
     // Top IP par pps (max 10)
     const ips = Object.entries(data.ips || {}).sort((a,b) => b[1].pps - a[1].pps).slice(0, 10);
     ipChart.data.labels = ips.map(([ip]) => ip);
     ipChart.data.datasets[0].data = ips.map(([, f]) => f.pps.toFixed(1));
-    ipChart.data.datasets[0].backgroundColor = ips.map(([ip]) => data.blacklist[ip] ? "#ff5470" : "#4da6ff");
+    ipChart.data.datasets[0].backgroundColor = ips.map(([ip]) => effectiveBlacklist[ip] ? "#ff5470" : "#4da6ff");
     ipChart.update();
 
     // Entropie
@@ -132,23 +149,37 @@ async function refresh() {
     entropyChart.data.datasets[0].data = eh.map(p => p[1]);
     entropyChart.update();
 
-    // Table blacklist
-    const blEntries = Object.entries(data.blacklist || {});
-    document.querySelector("#blacklistTable tbody").innerHTML = blEntries.map(([ip, exp]) =>
-      `<tr><td>${ip}</td><td>${fmtIn(exp)}</td></tr>`).join("");
+    // Table blacklist (réelle ou simulée selon le mode)
+    const blEntries = Object.entries(effectiveBlacklist);
+    document.querySelector("#blacklistTable thead").innerHTML =
+      data.dry_run ? "<tr><th>IP</th><th>Détectée il y a</th></tr>" : "<tr><th>IP</th><th>Expire dans</th></tr>";
+    document.querySelector("#blacklistTable tbody").innerHTML = blEntries.map(([ip, t]) =>
+      `<tr><td>${ip}</td><td>${data.dry_run ? fmtAgo(t) : fmtIn(t)}</td></tr>`).join("");
     document.getElementById("blacklistEmpty").style.display = blEntries.length ? "none" : "block";
     document.getElementById("blacklistTable").style.display = blEntries.length ? "table" : "none";
 
+    // Table whitelist
+    const wl = data.whitelist || [];
+    document.querySelector("#whitelistTable tbody").innerHTML = wl.map(ip => `<tr><td>${ip}</td></tr>`).join("");
+    document.getElementById("whitelistEmpty").style.display = wl.length ? "none" : "block";
+    document.getElementById("whitelistTable").style.display = wl.length ? "table" : "none";
+
     // Table trafic détaillé
     document.querySelector("#ipTable tbody").innerHTML = ips.map(([ip, f]) => {
-      const blocked = data.blacklist[ip];
+      const blocked = effectiveBlacklist[ip];
+      const whitelisted = wl.includes(ip);
+      let statusBadge = '<span class="badge ok">normale</span>';
+      if (whitelisted) statusBadge = '<span class="badge info">whitelistée</span>';
+      else if (blocked) statusBadge = data.dry_run
+        ? '<span class="badge warning">bloquerait (simulation)</span>'
+        : '<span class="badge danger">bloquée</span>';
       return `<tr>
         <td>${ip}</td>
         <td>${f.pps.toFixed(1)}</td>
         <td>${f.syn_ratio.toFixed(2)}</td>
         <td>${f.udp_ratio.toFixed(2)}</td>
         <td>${f.avg_pkt_size.toFixed(0)} o</td>
-        <td>${blocked ? '<span class="badge danger">bloquée</span>' : '<span class="badge ok">normale</span>'}</td>
+        <td>${statusBadge}</td>
       </tr>`;
     }).join("");
 

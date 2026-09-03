@@ -10,34 +10,35 @@ Rôle :
      la BPF Map "ip_stats" (paquets, octets, paquets SYN, paquets UDP).
   3. Dériver 4 features par IP : débit (pps), ratio de SYN sans ACK
      (SYN flood), ratio de paquets UDP (UDP flood), taille moyenne de paquet.
-  4. Entraîner un modèle Isolation Forest MULTI-DIMENSIONNEL sur ces
-     features, sur une FENÊTRE GLISSANTE d'historique par IP, et le
-     RÉENTRAÎNER PÉRIODIQUEMENT (toutes les RETRAIN_INTERVAL_SEC secondes)
-     pour s'adapter à l'évolution du trafic normal dans le temps
-     (concept drift) -- le modèle initial ne serait sinon jamais mis à
-     jour après son premier entraînement.
+  4. Entraîner un modèle Isolation Forest MULTI-DIMENSIONNEL sur une fenêtre
+     glissante par IP, ré-entraîné PÉRIODIQUEMENT (concept drift).
   5. Calculer à chaque cycle l'entropie de Shannon de la répartition du
-     trafic entre IP sources, pour détecter les attaques DISTRIBUÉES
-     (botnet) où chaque IP individuelle reste sous le seuil de détection
-     classique.
-  6. Inscrire les IP jugées malveillantes dans la BPF Map "blacklist"
-     (avec expiration TTL automatique), et journaliser une explication
-     de chaque décision (feature la plus atypique).
-  7. Exposer un DASHBOARD WEB TEMPS RÉEL (serveur HTTP intégré) affichant
-     le trafic par IP, l'entropie, les alertes et la blacklist en direct
-     -- pensé pour la démonstration en direct devant le jury.
+     trafic entre IP sources, pour détecter les attaques DISTRIBUÉES.
+  6. Décider du sort de chaque IP anormale selon la configuration :
+       - IP en LISTE BLANCHE       -> jamais bloquée, quoi qu'il arrive
+       - MODE DRY-RUN actif        -> détectée et journalisée, PAS bloquée
+       - sinon                     -> blacklistée (BPF Map), avec TTL
+  7. Exposer un DASHBOARD WEB TEMPS RÉEL (serveur HTTP intégré).
+
+Configuration :
+  Tous les paramètres (seuils, TTL, whitelist, dry-run, dashboard) sont
+  définis dans un fichier YAML (voir config/example.yaml) plutôt que codés
+  en dur -- un fichier de config différent par réseau/environnement testé.
+  Les arguments en ligne de commande, s'ils sont fournis, ont priorité sur
+  le fichier de configuration.
 
 Prérequis (à installer dans le conteneur xdp-router) :
   apt-get install -y bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
-  pip3 install scikit-learn numpy pandas
+  pip3 install scikit-learn numpy pandas pyyaml
   -> NB : bcc nécessite les headers du noyau HÔTE (le kernel du conteneur
-     est celui de la machine qui l'exécute). En environnement Containerlab,
-     s'assurer que linux-headers-$(uname -r) est bien disponible/installable
-     sur l'hôte, sinon monter /usr/src et /lib/modules en bind read-only.
+     est celui de la machine qui l'exécute).
 
 Usage :
+  # Avec un fichier de config (recommandé pour un nouveau déploiement) :
+  sudo python3 ai_engine.py --config config/config.yaml
+
+  # Ou entièrement en ligne de commande (utilise les valeurs par défaut) :
   sudo python3 ai_engine.py --iface eth1
-  # Dashboard accessible sur http://<ip-du-routeur>:8080 (--dashboard-port)
 """
 
 import argparse
@@ -57,27 +58,45 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from bcc import BPF
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 # ------------------------------------------------------------------
-# Configuration
+# Valeurs par défaut (utilisées si absentes du fichier de config et non
+# fournies en ligne de commande)
 # ------------------------------------------------------------------
-POLL_INTERVAL_SEC = 2          # fréquence de lecture des BPF Maps
-TRAINING_WINDOW = 150          # nb d'échantillons minimum avant le 1er entraînement
-                                # (empiriquement nécessaire pour bien séparer les
-                                # anomalies subtiles -- voir tests/test_ai_engine_logic.py)
-MAX_HISTORY_PER_IP = 600       # taille de la fenêtre glissante par IP (~20 min à 2s/cycle)
-RETRAIN_INTERVAL_SEC = 300     # ré-entraînement périodique (concept drift) : 5 min
-CONTAMINATION = 0.05           # proportion attendue d'anomalies (5%)
-BLACKLIST_TTL_SEC = 60         # durée avant déblocage automatique d'une IP
-ENTROPY_HISTORY_SIZE = 15
-ENTROPY_SPIKE_THRESHOLD = 0.35
+DEFAULT_CONFIG = {
+    "interface": None,
+    "detection": {
+        "contamination": 0.05,
+        "training_window": 150,
+        "max_history_per_ip": 600,
+        "retrain_interval_sec": 300,
+        "poll_interval_sec": 2,
+    },
+    "blacklist": {
+        "ttl_sec": 60,
+        "dry_run": False,
+        "whitelist": [],
+    },
+    "entropy": {
+        "history_size": 15,
+        "spike_threshold": 0.35,
+    },
+    "dashboard": {
+        "enabled": True,
+        "port": 8080,
+    },
+}
+
 BPF_SOURCE_FILE = "xdp_filter.c"
 XDP_FUNC_NAME = "xdp_filter_prog"
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
 
 # Ordre des features utilisées pour construire les vecteurs d'entrée du
-# modèle Isolation Forest. Ajouter une feature = l'ajouter ici + dans
-# extract_features() ; le reste du code (update/train/detect) s'adapte
-# automatiquement.
+# modèle Isolation Forest.
 FEATURE_NAMES = ["pps", "syn_ratio", "udp_ratio", "avg_pkt_size"]
 
 logging.basicConfig(
@@ -85,6 +104,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("ai_engine")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Fusionne `override` dans `base` récursivement (sans muter `base`)."""
+    result = dict(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def load_config(path) -> dict:
+    """Charge un fichier YAML de configuration et le fusionne avec les
+    valeurs par défaut (DEFAULT_CONFIG). Un fichier partiel (qui ne
+    surcharge que certaines clés) est parfaitement valide."""
+    if path is None:
+        return dict(DEFAULT_CONFIG)
+    if yaml is None:
+        raise RuntimeError("pyyaml n'est pas installé (pip3 install pyyaml) -- requis pour --config")
+    with open(path) as f:
+        user_config = yaml.safe_load(f) or {}
+    return _deep_merge(DEFAULT_CONFIG, user_config)
 
 
 def ip_int_to_str(ip_int: int) -> str:
@@ -117,8 +160,6 @@ class BPFMapInterface:
         self.blacklist_table = self.bpf["blacklist"]
 
     def read_ip_stats(self) -> dict:
-        """Retourne {ip_str: {"packets","bytes","syn_count","udp_count"}}
-        lu depuis la map ip_stats (struct ip_stat_t côté noyau)."""
         stats = {}
         for k, v in self.ip_stats_table.items():
             stats[ip_int_to_str(k.value)] = {
@@ -150,7 +191,6 @@ class BPFMapInterface:
 # Extraction de features multi-critères par IP
 # ------------------------------------------------------------------
 def compute_pps(prev_stats: dict, curr_stats: dict, elapsed_sec: float) -> dict:
-    """Débit (pps) par IP. Compatible ancien format (int) et nouveau (dict)."""
     pps = {}
     for ip_str, curr_val in curr_stats.items():
         curr_count = curr_val["packets"] if isinstance(curr_val, dict) else curr_val
@@ -162,21 +202,11 @@ def compute_pps(prev_stats: dict, curr_stats: dict, elapsed_sec: float) -> dict:
 
 
 def extract_features(prev_stats: dict, curr_stats: dict, elapsed_sec: float) -> dict:
-    """
-    Calcule, pour chaque IP source, le vecteur de features défini par
-    FEATURE_NAMES à partir de deux relevés successifs de ip_stats :
-
-      - pps           : paquets/seconde (débit brut)
-      - syn_ratio      : proportion de SYN-sans-ACK -> signature SYN flood
-      - udp_ratio      : proportion de paquets UDP -> signature UDP flood
-      - avg_pkt_size   : taille moyenne des paquets (octets)
-    """
     features = {}
     for ip_str, curr in curr_stats.items():
         prev = prev_stats.get(
             ip_str, {"packets": 0, "bytes": 0, "syn_count": 0, "udp_count": 0}
         )
-
         d_packets = max(curr["packets"] - prev["packets"], 0)
         d_bytes = max(curr["bytes"] - prev["bytes"], 0)
         d_syn = max(curr["syn_count"] - prev["syn_count"], 0)
@@ -188,24 +218,18 @@ def extract_features(prev_stats: dict, curr_stats: dict, elapsed_sec: float) -> 
         avg_pkt_size = (d_bytes / d_packets) if d_packets > 0 else 0.0
 
         features[ip_str] = {
-            "pps": pps,
-            "syn_ratio": syn_ratio,
-            "udp_ratio": udp_ratio,
-            "avg_pkt_size": avg_pkt_size,
+            "pps": pps, "syn_ratio": syn_ratio,
+            "udp_ratio": udp_ratio, "avg_pkt_size": avg_pkt_size,
         }
     return features
 
 
 def compute_source_entropy(curr_stats: dict) -> float:
-    """Entropie de Shannon (bits) de la répartition du trafic entre IP
-    sources. Une hausse brusque signale une attaque distribuée (voir
-    EntropyMonitor)."""
     total_packets = sum(
         (v["packets"] if isinstance(v, dict) else v) for v in curr_stats.values()
     )
     if total_packets == 0 or len(curr_stats) <= 1:
         return 0.0
-
     entropy = 0.0
     for v in curr_stats.values():
         count = v["packets"] if isinstance(v, dict) else v
@@ -217,11 +241,7 @@ def compute_source_entropy(curr_stats: dict) -> float:
 
 
 class EntropyMonitor:
-    """Moyenne mobile de l'entropie des IP sources + détection de pics
-    évocateurs d'une attaque distribuée."""
-
-    def __init__(self, history_size: int = ENTROPY_HISTORY_SIZE,
-                 spike_threshold: float = ENTROPY_SPIKE_THRESHOLD):
+    def __init__(self, history_size: int = 15, spike_threshold: float = 0.35):
         self.history = []
         self.history_size = history_size
         self.spike_threshold = spike_threshold
@@ -236,15 +256,16 @@ class EntropyMonitor:
 
 
 class TrafficAnomalyDetector:
-    """
-    Isolation Forest multi-dimensionnel (features définies par
-    FEATURE_NAMES), avec fenêtre glissante par IP (MAX_HISTORY_PER_IP) et
-    ré-entraînement périodique pour s'adapter au concept drift.
-    """
+    """Isolation Forest multi-dimensionnel, fenêtre glissante par IP,
+    ré-entraînement périodique. Tous les hyperparamètres sont injectés
+    (pas de constantes globales) pour permettre une config par déploiement."""
 
-    def __init__(self, contamination: float = CONTAMINATION):
+    def __init__(self, contamination: float = 0.05, training_window: int = 150,
+                 max_history_per_ip: int = 600):
         self.model = IsolationForest(contamination=contamination, random_state=42)
-        self.feature_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY_PER_IP))
+        self.training_window = training_window
+        self.max_history_per_ip = max_history_per_ip
+        self.feature_history = defaultdict(lambda: deque(maxlen=max_history_per_ip))
         self.is_trained = False
         self.last_train_time = None
 
@@ -258,7 +279,7 @@ class TrafficAnomalyDetector:
 
     def ready_to_train(self) -> bool:
         total_samples = sum(len(v) for v in self.feature_history.values())
-        return total_samples >= TRAINING_WINDOW
+        return total_samples >= self.training_window
 
     def train(self):
         samples = [row for values in self.feature_history.values() for row in values]
@@ -268,11 +289,10 @@ class TrafficAnomalyDetector:
         self.model.fit(X)
         self.is_trained = True
         self.last_train_time = time.time()
-        log.info("Modèle Isolation Forest (ré)entraîné sur %d échantillons (fenêtre glissante, features: %s)",
+        log.info("Modèle Isolation Forest (ré)entraîné sur %d échantillons (features: %s)",
                   len(samples), ", ".join(FEATURE_NAMES))
 
-    def due_for_retrain(self, now: float, interval_sec: float = RETRAIN_INTERVAL_SEC) -> bool:
-        """True si un ré-entraînement périodique est dû (concept drift)."""
+    def due_for_retrain(self, now: float, interval_sec: float) -> bool:
         if not self.is_trained:
             return False
         return (now - self.last_train_time) >= interval_sec
@@ -284,7 +304,6 @@ class TrafficAnomalyDetector:
         return np.array(samples).mean(axis=0)
 
     def detect(self, ip_features: dict) -> dict:
-        """Retourne {ip_str: vecteur_features} pour les IP anormales (-1)."""
         if not self.is_trained or not ip_features:
             return {}
         ips = list(ip_features.keys())
@@ -304,23 +323,30 @@ class TrafficAnomalyDetector:
 # Dashboard web temps réel
 # ------------------------------------------------------------------
 class DashboardState:
-    """État partagé thread-safe entre la boucle de détection et le
-    serveur HTTP du dashboard."""
-
     def __init__(self):
         self.lock = threading.Lock()
         self.latest_features = {}
-        self.entropy_history = []   # [[timestamp, entropy], ...]
-        self.blacklist_expiry = {}  # ip_str -> timestamp d'expiration
-        self.alerts = []            # [{"timestamp":, "level":, "message":}, ...]
+        self.entropy_history = []
+        self.blacklist_expiry = {}       # ip -> timestamp d'expiration (blocage RÉEL)
+        self.simulated_blacklist = {}    # ip -> timestamp de dernière détection (dry-run)
+        self.whitelist = []
+        self.dry_run = False
+        self.alerts = []
 
-    def record_cycle(self, features: dict, entropy: float, blacklisted_since: dict, ttl: int):
+    def set_mode(self, dry_run: bool, whitelist: list):
+        with self.lock:
+            self.dry_run = dry_run
+            self.whitelist = list(whitelist)
+
+    def record_cycle(self, features: dict, entropy: float, blacklisted_since: dict,
+                      simulated_since: dict, ttl: int):
         with self.lock:
             self.latest_features = features
             self.entropy_history.append([time.time(), entropy])
             if len(self.entropy_history) > 300:
                 self.entropy_history.pop(0)
             self.blacklist_expiry = {ip: ts + ttl for ip, ts in blacklisted_since.items()}
+            self.simulated_blacklist = dict(simulated_since)
 
     def add_alert(self, level: str, message: str):
         with self.lock:
@@ -335,6 +361,9 @@ class DashboardState:
                 "ips": self.latest_features,
                 "entropy_history": list(self.entropy_history[-120:]),
                 "blacklist": self.blacklist_expiry,
+                "simulated_blacklist": self.simulated_blacklist,
+                "whitelist": self.whitelist,
+                "dry_run": self.dry_run,
                 "alerts": list(self.alerts[-20:]),
                 "feature_names": FEATURE_NAMES,
             }
@@ -358,7 +387,7 @@ def make_dashboard_handler(state: DashboardState):
                 super().do_GET()
 
         def log_message(self, fmt, *args):
-            pass  # silence les logs HTTP par défaut (bruyants en continu)
+            pass
 
     return Handler
 
@@ -372,79 +401,142 @@ def start_dashboard_server(state: DashboardState, port: int):
     return server
 
 
+def build_settings(args) -> dict:
+    """Fusionne le fichier de config (si fourni) et les arguments CLI
+    (qui ont priorité). Retourne un dict de settings prêt à l'emploi."""
+    config = load_config(args.config)
+
+    iface = args.iface or config["interface"]
+    if not iface:
+        raise SystemExit("Aucune interface spécifiée (--iface ou 'interface:' dans le fichier de config)")
+
+    ttl = args.ttl if args.ttl is not None else config["blacklist"]["ttl_sec"]
+    retrain_interval = (args.retrain_interval if args.retrain_interval is not None
+                         else config["detection"]["retrain_interval_sec"])
+    dashboard_port = (args.dashboard_port if args.dashboard_port is not None
+                       else config["dashboard"]["port"])
+    dashboard_enabled = config["dashboard"]["enabled"] and not args.no_dashboard
+    dry_run = bool(config["blacklist"]["dry_run"] or args.dry_run)
+    whitelist = set(config["blacklist"].get("whitelist") or [])
+
+    return {
+        "iface": iface,
+        "ttl": ttl,
+        "retrain_interval": retrain_interval,
+        "dashboard_port": dashboard_port,
+        "dashboard_enabled": dashboard_enabled,
+        "dry_run": dry_run,
+        "whitelist": whitelist,
+        "contamination": config["detection"]["contamination"],
+        "training_window": config["detection"]["training_window"],
+        "max_history_per_ip": config["detection"]["max_history_per_ip"],
+        "poll_interval": config["detection"]["poll_interval_sec"],
+        "entropy_history_size": config["entropy"]["history_size"],
+        "entropy_spike_threshold": config["entropy"]["spike_threshold"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Moteur IA de détection DDoS (XDP + Isolation Forest multi-critères)")
-    parser.add_argument("--iface", required=True, help="Interface réseau où attacher le programme XDP (ex: eth1)")
-    parser.add_argument("--log-csv", default=None, help="Fichier CSV de log détaillé par cycle (pour benchmark)")
-    parser.add_argument("--ttl", type=int, default=BLACKLIST_TTL_SEC,
-                         help=f"Durée avant déblocage automatique d'une IP (défaut: {BLACKLIST_TTL_SEC}s)")
-    parser.add_argument("--retrain-interval", type=int, default=RETRAIN_INTERVAL_SEC,
-                         help=f"Intervalle de ré-entraînement périodique en secondes (défaut: {RETRAIN_INTERVAL_SEC}s)")
-    parser.add_argument("--dashboard-port", type=int, default=8080,
-                         help="Port du dashboard web temps réel (défaut: 8080)")
+    parser.add_argument("--config", default=None,
+                         help="Fichier YAML de configuration (voir config/example.yaml). "
+                              "Les options CLI ci-dessous, si fournies, ont priorité.")
+    parser.add_argument("--iface", default=None, help="Interface réseau où attacher le programme XDP")
+    parser.add_argument("--log-csv", default=None, help="Fichier CSV de log détaillé par cycle")
+    parser.add_argument("--ttl", type=int, default=None, help="Durée avant déblocage automatique d'une IP")
+    parser.add_argument("--retrain-interval", type=int, default=None, help="Intervalle de ré-entraînement (s)")
+    parser.add_argument("--dashboard-port", type=int, default=None, help="Port du dashboard web")
     parser.add_argument("--no-dashboard", action="store_true", help="Désactive le dashboard web")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="Force le mode simulation : détecte et journalise, ne bloque JAMAIS "
+                              "(s'ajoute au réglage du fichier de config, ne le désactive pas)")
     args = parser.parse_args()
 
-    log.info("Démarrage du moteur IA sur %s (TTL: %ds, ré-entraînement: %ds)",
-              args.iface, args.ttl, args.retrain_interval)
-    bpf_maps = BPFMapInterface(args.iface)
-    detector = TrafficAnomalyDetector()
-    entropy_monitor = EntropyMonitor()
+    settings = build_settings(args)
+
+    log.info("Démarrage -- iface=%s, TTL=%ds, ré-entraînement=%ds, DRY-RUN=%s, whitelist=%d IP(s)",
+              settings["iface"], settings["ttl"], settings["retrain_interval"],
+              settings["dry_run"], len(settings["whitelist"]))
+    if settings["dry_run"]:
+        log.warning("*** MODE SIMULATION ACTIF : aucune IP ne sera réellement bloquée ***")
+
+    bpf_maps = BPFMapInterface(settings["iface"])
+    detector = TrafficAnomalyDetector(
+        contamination=settings["contamination"],
+        training_window=settings["training_window"],
+        max_history_per_ip=settings["max_history_per_ip"],
+    )
+    entropy_monitor = EntropyMonitor(
+        history_size=settings["entropy_history_size"],
+        spike_threshold=settings["entropy_spike_threshold"],
+    )
 
     state = DashboardState()
-    if not args.no_dashboard:
-        start_dashboard_server(state, args.dashboard_port)
+    state.set_mode(settings["dry_run"], settings["whitelist"])
+    if settings["dashboard_enabled"]:
+        start_dashboard_server(state, settings["dashboard_port"])
 
     csv_writer, csv_file = None, None
     if args.log_csv:
         csv_file = open(args.log_csv, "w", newline="")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["timestamp", "ip"] + FEATURE_NAMES + ["blacklisted", "source_entropy"])
+        csv_writer.writerow(["timestamp", "ip"] + FEATURE_NAMES + ["blacklisted", "dry_run_flagged", "source_entropy"])
 
     prev_stats = {}
-    blacklisted_since = {}
+    blacklisted_since = {}   # blocage RÉEL (BPF Map)
+    simulated_since = {}     # détection en mode dry-run (jamais dans la BPF Map)
 
     try:
         while True:
             start = time.time()
 
             curr_stats = bpf_maps.read_ip_stats()
-            features = extract_features(prev_stats, curr_stats, POLL_INTERVAL_SEC)
+            features = extract_features(prev_stats, curr_stats, settings["poll_interval"])
             source_entropy = compute_source_entropy(curr_stats)
             prev_stats = curr_stats
 
             detector.update(features)
 
-            # 1er entraînement
             if not detector.is_trained and detector.ready_to_train():
                 detector.train()
                 state.add_alert("info", "Modèle initial entraîné")
 
-            # Ré-entraînement périodique (concept drift)
-            if detector.due_for_retrain(start, args.retrain_interval):
+            if detector.due_for_retrain(start, settings["retrain_interval"]):
                 detector.train()
                 state.add_alert("info", "Modèle ré-entraîné (fenêtre glissante mise à jour)")
 
-            # Détection par IP (multi-critères)
             anomalies = detector.detect(features) if detector.is_trained else {}
             for ip_str, vec in anomalies.items():
-                if ip_str not in blacklisted_since:
-                    explanation = detector.explain(ip_str, vec)
+                if ip_str in settings["whitelist"]:
+                    continue  # jamais bloquée, quoi qu'il arrive
+
+                explanation = detector.explain(ip_str, vec)
+
+                if settings["dry_run"]:
+                    if ip_str not in simulated_since:
+                        log.warning("[DRY-RUN] %s aurait été bloquée | %s", ip_str, explanation)
+                        state.add_alert("warning", f"[SIMULATION] {ip_str} aurait été bloquée -- {explanation}")
+                    simulated_since[ip_str] = start
+                elif ip_str not in blacklisted_since:
                     log.warning("Anomalie détectée : %s -> blacklist (TTL %ds) | %s",
-                                ip_str, args.ttl, explanation)
+                                ip_str, settings["ttl"], explanation)
                     bpf_maps.add_to_blacklist(ip_str)
                     blacklisted_since[ip_str] = start
                     state.add_alert("danger", f"{ip_str} bloquée -- {explanation}")
 
-            # Expiration TTL
-            expired = [ip for ip, ts in blacklisted_since.items() if start - ts >= args.ttl]
+            # Expiration TTL (blocage réel uniquement)
+            expired = [ip for ip, ts in blacklisted_since.items() if start - ts >= settings["ttl"]]
             for ip_str in expired:
                 log.info("TTL expiré pour %s -> déblocage automatique", ip_str)
                 bpf_maps.remove_from_blacklist(ip_str)
                 del blacklisted_since[ip_str]
                 state.add_alert("info", f"{ip_str} débloquée (TTL expiré)")
 
-            # Détection distribuée par entropie
+            # Purge des entrées simulées trop anciennes (visibilité dashboard uniquement)
+            sim_expired = [ip for ip, ts in simulated_since.items() if start - ts >= settings["ttl"]]
+            for ip_str in sim_expired:
+                del simulated_since[ip_str]
+
             is_spike, baseline = entropy_monitor.update_and_check(source_entropy)
             if is_spike:
                 msg = (f"Hausse anormale de l'entropie des IP sources : {source_entropy:.2f} bits "
@@ -452,19 +544,17 @@ def main():
                 log.warning(msg)
                 state.add_alert("warning", msg)
 
-            # Mise à jour de l'état du dashboard
-            state.record_cycle(features, source_entropy, blacklisted_since, args.ttl)
+            state.record_cycle(features, source_entropy, blacklisted_since, simulated_since, settings["ttl"])
 
-            # Logging CSV optionnel
             if csv_writer:
                 for ip_str, feat in features.items():
                     row = [start, ip_str] + [feat[name] for name in FEATURE_NAMES]
-                    row += [ip_str in blacklisted_since, source_entropy]
+                    row += [ip_str in blacklisted_since, ip_str in simulated_since, source_entropy]
                     csv_writer.writerow(row)
                 csv_file.flush()
 
             elapsed = time.time() - start
-            time.sleep(max(0, POLL_INTERVAL_SEC - elapsed))
+            time.sleep(max(0, settings["poll_interval"] - elapsed))
 
     except KeyboardInterrupt:
         log.info("Arrêt demandé (Ctrl+C)")

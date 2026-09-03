@@ -67,7 +67,7 @@ En plus du `syn_ratio` (SYN flood), le système calcule un `udp_ratio` par IP (p
 
 Accessible sur `http://<ip-du-routeur>:8080` (port configurable via `--dashboard-port`, désactivable via `--no-dashboard`). Pensé pour la **démonstration en direct** demandée dans le cahier des charges : l'attaque et son blocage sont visibles en temps réel, sans dépendre de la lecture de logs texte.
 
-## 3. Structure du dépôt
+## 4. Structure du dépôt
 
 ```
 lab/
@@ -82,6 +82,10 @@ src/
 dashboard/
   index.html               Dashboard temps réel (HTML/JS autonome, Chart.js
                           via CDN), servi directement par ai_engine.py
+config/
+  example.yaml             Modèle de fichier de configuration (à copier et
+                          adapter par environnement testé -- interface,
+                          whitelist, dry-run, seuils)
 scripts/
   run_benchmark.sh        Génère trafic légitime (iperf3) + attaque (hping3),
                           mesure CPU et latence, en mode baseline ou protected
@@ -97,7 +101,7 @@ requirements.txt          Dépendances Python (scikit-learn, numpy, pandas,
                           matplotlib, pytest)
 ```
 
-## 4. Prérequis
+## 5. Prérequis
 
 - Machine Linux (kernel 5.15+), Ubuntu 22.04/24.04 recommandé
 - [Docker](https://docs.docker.com/engine/install/)
@@ -106,7 +110,7 @@ requirements.txt          Dépendances Python (scikit-learn, numpy, pandas,
 
 > ⚠️ **bcc et les headers noyau** : `ai_engine.py` compile `xdp_filter.c` à l'exécution via `bcc`, qui a besoin des headers du noyau de la machine **hôte** (les conteneurs partagent ce noyau). Si l'installation de `linux-headers-$(uname -r)` échoue dans le conteneur `xdp-router`, monter `/usr/src` et `/lib/modules` de l'hôte en bind read-only dans `lab/topology.clab.yaml`.
 
-## 5. Installation et déploiement du lab
+## 6. Installation et déploiement du lab
 
 ```bash
 git clone https://github.com/Fabio1434/mems.git
@@ -120,12 +124,49 @@ sudo containerlab deploy -t lab/topology.clab.yaml
 sudo docker exec -it clab-xdp-ai-lab-attacker ping -c 3 10.0.3.2
 ```
 
-## 6. Lancer la protection (XDP + IA)
+## 7. Configuration par environnement (fichier config.yaml)
+
+Pour tester ce système sur un réseau réel (pas seulement le lab de développement), **ne pas modifier le code** -- créer un fichier de configuration dédié à cet environnement :
+
+```bash
+cp config/example.yaml config/mon-environnement.yaml
+# éditer mon-environnement.yaml : interface, whitelist, dry_run, seuils...
+python3 src/ai_engine.py --config config/mon-environnement.yaml
+```
+
+Les arguments en ligne de commande (`--ttl`, `--iface`, etc.), s'ils sont fournis, ont priorité sur le fichier de configuration.
+
+### Mode simulation (dry-run) -- à utiliser en premier sur tout nouveau réseau
+
+```yaml
+blacklist:
+  dry_run: true
+```
+
+En mode dry-run, le système **détecte et journalise** les anomalies (visibles dans les logs, le dashboard, et le CSV si `--log-csv` est utilisé) mais **ne bloque jamais réellement de trafic**. C'est le point de départ recommandé pour tout nouvel environnement testé : faire tourner le système quelques heures/jours en dry-run, observer le taux de détection, ajuster `contamination` et les seuils, **avant** de passer en `dry_run: false`.
+
+### Liste blanche (whitelist) -- filet de sécurité obligatoire
+
+```yaml
+blacklist:
+  whitelist:
+    - 10.0.2.1   # passerelle réseau
+    - 8.8.8.8    # ex: résolveur DNS
+```
+
+Les IP de la whitelist ne sont **jamais** bloquées, même si le modèle les juge anormales. À renseigner systématiquement pour toute IP dont le blocage aurait un impact critique (passerelle, DNS, sondes de supervision, IP de management).
+
+## 8. Lancer la protection (XDP + IA)
 
 Depuis le conteneur `xdp-router` :
 
 ```bash
 sudo docker exec -it clab-xdp-ai-lab-xdp-router bash
+
+# Avec un fichier de config (recommandé)
+python3 /root/ai_engine.py --config /root/config/mon-environnement.yaml
+
+# Ou en ligne de commande directe
 python3 /root/ai_engine.py --iface eth1
 ```
 
@@ -135,19 +176,24 @@ Le script attache le programme XDP sur `eth1` (interface côté attaquant), puis
 
 | Option | Rôle |
 |---|---|
-| `--iface <if>` | Interface où attacher le programme XDP (obligatoire) |
+| `--config <fichier>` | Fichier YAML de configuration (voir section 6) |
+| `--iface <if>` | Interface où attacher le programme XDP (obligatoire si absent du fichier de config) |
+| `--dry-run` | Force le mode simulation (détecte, ne bloque jamais) |
 | `--ttl <sec>` | Durée avant déblocage automatique d'une IP (défaut : 60s) |
 | `--retrain-interval <sec>` | Intervalle de ré-entraînement périodique du modèle (défaut : 300s) |
 | `--dashboard-port <port>` | Port du dashboard web temps réel (défaut : 8080) |
 | `--no-dashboard` | Désactive le dashboard web |
 | `--log-csv <fichier>` | Log détaillé (timestamp, IP, features, blacklist, entropie) pour un benchmark précis |
 
-Une fois lancé, le dashboard temps réel est accessible sur `http://<ip-du-routeur>:8080` (ou l'IP publiée par Containerlab pour ce conteneur).
+Une fois lancé, le dashboard temps réel est accessible sur `http://<ip-du-routeur>:8080` (ou l'IP publiée par Containerlab pour ce conteneur). En mode dry-run, un bandeau d'avertissement s'affiche en haut du dashboard.
 
 Ou via les scripts pratiques (gèrent le PID, les logs et le CSV automatiquement) :
 
 ```bash
-./scripts/start_protection.sh eth1
+./scripts/start_protection.sh config/mon-environnement.yaml
+# ou, sans fichier de config :
+./scripts/start_protection.sh "" eth1
+
 ./scripts/stop_protection.sh
 ```
 
@@ -161,7 +207,7 @@ ip link set dev eth1 xdp off
 
 > **Note sur `TRAINING_WINDOW`** : fixé empiriquement à 150 échantillons (voir tests). Avec un historique d'entraînement trop court (testé à 30), l'Isolation Forest manque de données pour bien séparer les anomalies subtiles (SYN flood furtif à débit quasi-normal) -- un point à documenter dans le rapport si vous ajustez cette valeur.
 
-## 7. Tests unitaires
+## 9. Tests unitaires
 
 La logique métier (conversion IP, calcul du débit, détection d'anomalies) est testable **sans bcc/eBPF** (donc sans machine Linux privilégiée), via un mock du module `bcc` :
 
@@ -172,7 +218,7 @@ pytest tests/test_ai_engine_logic.py -v
 
 > **Limitation connue** : avec le paramètre `contamination` par défaut (0.05), le modèle Isolation Forest peut occasionnellement flaguer une IP légitime en même temps qu'un flood massif, si son débit s'écarte un peu de la distribution d'entraînement. Ce paramètre est à calibrer sur un jeu de trafic réel représentatif avant la démonstration finale -- c'est un point à documenter dans le rapport (compromis faux positifs / faux négatifs).
 
-## 8. Lancer les benchmarks
+## 10. Lancer les benchmarks
 
 ```bash
 cd scripts/
@@ -191,7 +237,7 @@ Résultats produits dans `scripts/benchmark_results/` :
 - `baseline/` et `protected/` — CSV bruts (CPU, latence, résumé de trafic)
 - `graphs/` — `cpu_comparison.png`, `latency_comparison.png`, `packets_comparison.png`
 
-## 9. Outils de génération de trafic et d'analyse
+## 11. Outils de génération de trafic et d'analyse
 
 | Outil | Usage |
 |---|---|
@@ -202,16 +248,18 @@ Résultats produits dans `scripts/benchmark_results/` :
 | `tcpdump` | Capture de paquets pour validation |
 | `htop` / `perf` | Analyse de charge CPU du routeur |
 
-## 10. Livrables du mémoire
+## 12. Livrables du mémoire
 
-- [x] `xdp_filter.c` — programme noyau eBPF/XDP
-- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps (avec TTL et logging CSV)
+- [x] `xdp_filter.c` — programme noyau eBPF/XDP (TCP + UDP)
+- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps (TTL, dashboard, config, dry-run, whitelist)
 - [x] `topology.clab.yaml` — infrastructure de test
-- [x] Tests unitaires de la logique de détection
+- [x] Tests unitaires de la logique de détection (33 tests)
+- [x] Dashboard temps réel pour la démonstration en direct
+- [x] Fichier de configuration par environnement + mode simulation (dry-run) pour un déploiement sûr sur un réseau réel
 - [ ] Dossier d'évaluation des performances (graphiques comparatifs) — à générer après exécution des benchmarks sur le lab réel
 - [ ] Rapport de mémoire complet (état de l'art, conception, implémentation, résultats)
 - [ ] Démonstration en direct devant le jury
 
-## 11. Auteur
+## 13. Auteur
 
 Fabio — Master 2 Télécommunications & Cybersécurité

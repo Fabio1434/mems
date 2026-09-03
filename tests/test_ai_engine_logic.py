@@ -45,6 +45,12 @@ spec = importlib.util.spec_from_file_location("ai_engine", SRC_PATH)
 ai_engine = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ai_engine)
 
+# Valeurs par défaut utilisées dans les tests (le module n'expose plus de
+# constantes globales -- tous les hyperparamètres sont injectables, voir
+# TrafficAnomalyDetector.__init__ et DEFAULT_CONFIG)
+TEST_TRAINING_WINDOW = ai_engine.DEFAULT_CONFIG["detection"]["training_window"]
+TEST_MAX_HISTORY_PER_IP = ai_engine.DEFAULT_CONFIG["detection"]["max_history_per_ip"]
+
 
 # ------------------------------------------------------------------
 # Tests : conversion d'adresses IP
@@ -166,14 +172,14 @@ def test_entropy_monitor_no_spike_on_stable_traffic():
 # ------------------------------------------------------------------
 def test_detector_not_trained_before_window():
     det = ai_engine.TrafficAnomalyDetector(contamination=0.1)
-    for _ in range(ai_engine.TRAINING_WINDOW - 1):
+    for _ in range(TEST_TRAINING_WINDOW - 1):
         det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
     assert not det.ready_to_train()
 
 
 def test_detector_trains_at_window_threshold():
     det = ai_engine.TrafficAnomalyDetector(contamination=0.1)
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
     assert det.ready_to_train()
     det.train()
@@ -184,7 +190,7 @@ def test_detector_flags_volumetric_flood():
     """Un flood classique (pps très élevé) doit être détecté."""
     random.seed(0)
     det = ai_engine.TrafficAnomalyDetector(contamination=0.05)
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {
             "pps": 10 + random.random() * 10,
             "syn_ratio": 0.05 + random.random() * 0.1,
@@ -210,7 +216,7 @@ def test_detector_flags_stealthy_syn_flood_via_syn_ratio():
     """
     random.seed(1)
     det = ai_engine.TrafficAnomalyDetector(contamination=0.05)
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {
             "pps": 15 + random.random() * 5,
             "syn_ratio": 0.05 + random.random() * 0.1,
@@ -233,7 +239,7 @@ def test_detector_flags_stealthy_udp_flood_via_udp_ratio():
     dans le cahier des charges initial (SYN/UDP Flood)."""
     random.seed(2)
     det = ai_engine.TrafficAnomalyDetector(contamination=0.05)
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {
             "pps": 15 + random.random() * 5,
             "syn_ratio": 0.05 + random.random() * 0.1,
@@ -256,16 +262,16 @@ def test_detector_sliding_window_caps_history_per_ip():
     qui reflète le trafic RÉCENT, pas tout l'historique depuis le
     démarrage)."""
     det = ai_engine.TrafficAnomalyDetector()
-    for _ in range(ai_engine.MAX_HISTORY_PER_IP + 100):
+    for _ in range(TEST_MAX_HISTORY_PER_IP + 100):
         det.update({"1.1.1.1": {"pps": 1, "syn_ratio": 0, "udp_ratio": 0, "avg_pkt_size": 100}})
-    assert len(det.feature_history["1.1.1.1"]) == ai_engine.MAX_HISTORY_PER_IP
+    assert len(det.feature_history["1.1.1.1"]) == TEST_MAX_HISTORY_PER_IP
 
 
 def test_detector_due_for_retrain_respects_interval():
     """Le modèle doit être signalé comme dû pour un ré-entraînement
     seulement après l'intervalle configuré (concept drift)."""
     det = ai_engine.TrafficAnomalyDetector()
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {"pps": 15, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
     det.train()
 
@@ -283,7 +289,7 @@ def test_detector_not_trained_never_due_for_retrain():
 def test_detector_explain_identifies_most_atypical_feature():
     random.seed(1)
     det = ai_engine.TrafficAnomalyDetector(contamination=0.05)
-    for _ in range(ai_engine.TRAINING_WINDOW):
+    for _ in range(TEST_TRAINING_WINDOW):
         det.update({"1.1.1.1": {
             "pps": 15 + random.random() * 5,
             "syn_ratio": 0.05 + random.random() * 0.1,
@@ -302,6 +308,87 @@ def test_detector_empty_input_returns_no_anomalies():
 
 
 # ------------------------------------------------------------------
+# Tests : configuration externe (config.yaml), mode dry-run, whitelist
+# ------------------------------------------------------------------
+CONFIG_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "config" / "example.yaml"
+
+
+def test_load_config_from_real_file():
+    cfg = ai_engine.load_config(str(CONFIG_EXAMPLE_PATH))
+    assert cfg["interface"] == "eth1"
+    assert cfg["blacklist"]["dry_run"] is True
+    assert "10.0.2.1" in cfg["blacklist"]["whitelist"]
+
+
+def test_load_config_none_returns_defaults():
+    cfg = ai_engine.load_config(None)
+    assert cfg == ai_engine.DEFAULT_CONFIG
+    assert cfg["blacklist"]["dry_run"] is False
+
+
+def test_deep_merge_partial_override_keeps_other_defaults():
+    merged = ai_engine._deep_merge(ai_engine.DEFAULT_CONFIG, {"blacklist": {"ttl_sec": 999}})
+    assert merged["blacklist"]["ttl_sec"] == 999
+    # Les clés non mentionnées dans l'override restent aux valeurs par défaut
+    assert merged["blacklist"]["dry_run"] == ai_engine.DEFAULT_CONFIG["blacklist"]["dry_run"]
+    assert merged["detection"]["contamination"] == ai_engine.DEFAULT_CONFIG["detection"]["contamination"]
+
+
+class _FakeArgs:
+    """Simule argparse.Namespace pour tester build_settings() sans CLI réelle."""
+    def __init__(self, **kwargs):
+        defaults = dict(config=None, iface=None, ttl=None, retrain_interval=None,
+                         dashboard_port=None, no_dashboard=False, dry_run=False)
+        defaults.update(kwargs)
+        for k, v in defaults.items():
+            setattr(self, k, v)
+
+
+def test_build_settings_config_file_provides_defaults():
+    args = _FakeArgs(config=str(CONFIG_EXAMPLE_PATH))
+    settings = ai_engine.build_settings(args)
+    assert settings["iface"] == "eth1"
+    assert settings["dry_run"] is True
+    assert "10.0.2.1" in settings["whitelist"]
+
+
+def test_build_settings_cli_overrides_config_file():
+    """Les arguments CLI explicites doivent primer sur le fichier de config."""
+    args = _FakeArgs(config=str(CONFIG_EXAMPLE_PATH), ttl=999)
+    settings = ai_engine.build_settings(args)
+    assert settings["ttl"] == 999          # override CLI
+    assert settings["iface"] == "eth1"     # vient toujours du fichier
+
+
+def test_build_settings_dry_run_flag_forces_simulation():
+    """--dry-run en CLI doit activer le mode simulation même si absent
+    (ou à false) dans le fichier de config."""
+    args = _FakeArgs(iface="eth1", dry_run=True)
+    settings = ai_engine.build_settings(args)
+    assert settings["dry_run"] is True
+
+
+def test_build_settings_requires_interface():
+    args = _FakeArgs(config=None, iface=None)
+    with pytest.raises(SystemExit):
+        ai_engine.build_settings(args)
+
+
+def test_detector_accepts_injected_hyperparameters():
+    """TrafficAnomalyDetector ne doit dépendre d'aucune constante globale
+    -- tous les hyperparamètres doivent être injectables (nécessaire pour
+    un fichier de config différent par déploiement)."""
+    det = ai_engine.TrafficAnomalyDetector(contamination=0.1, training_window=50, max_history_per_ip=100)
+    assert det.training_window == 50
+    assert det.max_history_per_ip == 100
+    for _ in range(50):
+        det.update({"1.1.1.1": {"pps": 10, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}})
+    assert det.ready_to_train()
+    det.train()
+    assert det.is_trained
+
+
+# ------------------------------------------------------------------
 # Tests : dashboard temps réel (serveur HTTP réel, sur localhost)
 # ------------------------------------------------------------------
 def test_dashboard_state_snapshot_reflects_updates():
@@ -310,6 +397,7 @@ def test_dashboard_state_snapshot_reflects_updates():
         {"1.1.1.1": {"pps": 15.0, "syn_ratio": 0.1, "udp_ratio": 0.02, "avg_pkt_size": 800}},
         entropy=2.3,
         blacklisted_since={"9.9.9.9": time.time()},
+        simulated_since={},
         ttl=60,
     )
     state.add_alert("danger", "test alert")
@@ -317,6 +405,26 @@ def test_dashboard_state_snapshot_reflects_updates():
     assert "1.1.1.1" in snap["ips"]
     assert "9.9.9.9" in snap["blacklist"]
     assert len(snap["alerts"]) == 1
+
+
+def test_dashboard_state_dry_run_mode_uses_simulated_blacklist():
+    """En mode dry-run, aucune IP ne doit apparaître dans la blacklist
+    RÉELLE -- seulement dans simulated_blacklist, avec le flag dry_run à
+    True pour que le dashboard affiche le bandeau d'avertissement."""
+    state = ai_engine.DashboardState()
+    state.set_mode(dry_run=True, whitelist=["10.0.2.1"])
+    state.record_cycle(
+        {"9.9.9.9": {"pps": 500, "syn_ratio": 0.9, "udp_ratio": 0.0, "avg_pkt_size": 60}},
+        entropy=1.0,
+        blacklisted_since={},
+        simulated_since={"9.9.9.9": time.time()},
+        ttl=60,
+    )
+    snap = state.snapshot()
+    assert snap["dry_run"] is True
+    assert "10.0.2.1" in snap["whitelist"]
+    assert "9.9.9.9" in snap["simulated_blacklist"]
+    assert snap["blacklist"] == {}
 
 
 def test_dashboard_http_server_serves_api_and_static_page():
@@ -329,7 +437,7 @@ def test_dashboard_http_server_serves_api_and_static_page():
     state = ai_engine.DashboardState()
     state.record_cycle(
         {"1.1.1.1": {"pps": 10.0, "syn_ratio": 0.05, "udp_ratio": 0.01, "avg_pkt_size": 700}},
-        entropy=1.5, blacklisted_since={}, ttl=60,
+        entropy=1.5, blacklisted_since={}, simulated_since={}, ttl=60,
     )
     server = ai_engine.start_dashboard_server(state, port=0)
     port = server.server_address[1]

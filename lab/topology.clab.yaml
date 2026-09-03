@@ -32,7 +32,7 @@ topology:
         # NB: bcc a besoin des headers du noyau HOTE ; si linux-headers-generic
         # ne correspond pas au kernel de la machine hôte, monter /usr/src et
         # /lib/modules en bind read-only depuis l'hôte à la place.
-        - pip3 install scikit-learn numpy pandas
+        - pip3 install scikit-learn numpy pandas pyyaml
         # eth1 -> attacker
         - ip addr add 10.0.1.1/30 dev eth1
         - ip link set eth1 up
