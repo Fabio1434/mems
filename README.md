@@ -1,7 +1,7 @@
 # Détection et neutralisation automatisée des cyberattaques à haute vitesse
 ### Mémoire de Master 2 — Télécommunications & Cybersécurité
 
-Sécurisation des infrastructures télécoms à très haut débit via **eBPF/XDP** et **Intelligence Artificielle** (Isolation Forest).
+Sécurisation des infrastructures à très haut débit via **eBPF/XDP** et **Intelligence Artificielle** (Isolation Forest).
 
 ## 1. Contexte
 
