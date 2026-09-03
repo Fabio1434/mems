@@ -389,6 +389,116 @@ def test_detector_accepts_injected_hyperparameters():
 
 
 # ------------------------------------------------------------------
+# Tests : persistance du modèle (joblib) -- round-trip réel sur disque
+# ------------------------------------------------------------------
+def test_model_save_and_load_roundtrip(tmp_path):
+    """Un modèle sauvegardé puis rechargé (simulant un redémarrage) doit
+    détecter exactement les mêmes anomalies que l'original -- vérifie un
+    vrai aller-retour sur disque, pas seulement l'état en mémoire."""
+    random.seed(3)
+    det = ai_engine.TrafficAnomalyDetector(contamination=0.05, training_window=150, max_history_per_ip=600)
+    for _ in range(150):
+        det.update({"1.1.1.1": {
+            "pps": 15 + random.random() * 5,
+            "syn_ratio": 0.05 + random.random() * 0.1,
+            "udp_ratio": 0.02 + random.random() * 0.05,
+            "avg_pkt_size": 750 + random.random() * 100,
+        }})
+    det.train()
+
+    model_path = str(tmp_path / "model.joblib")
+    det.save(model_path)
+    assert Path(model_path).exists()
+
+    det_reloaded = ai_engine.TrafficAnomalyDetector(contamination=0.05, training_window=150, max_history_per_ip=600)
+    assert not det_reloaded.is_trained
+    assert det_reloaded.load(model_path) is True
+    assert det_reloaded.is_trained
+
+    flood = {"9.9.9.9": {"pps": 50000, "syn_ratio": 0.9, "udp_ratio": 0.05, "avg_pkt_size": 60}}
+    assert "9.9.9.9" in det.detect(flood)
+    assert "9.9.9.9" in det_reloaded.detect(flood)
+
+
+def test_model_load_missing_file_returns_false():
+    det = ai_engine.TrafficAnomalyDetector()
+    assert det.load("/tmp/ce_fichier_n_existe_vraiment_pas_12345.joblib") is False
+    assert not det.is_trained
+
+
+def test_model_save_noop_when_not_trained(tmp_path):
+    """save() sur un détecteur non entraîné ne doit rien écrire (pas
+    d'erreur, pas de fichier vide trompeur)."""
+    det = ai_engine.TrafficAnomalyDetector()
+    model_path = str(tmp_path / "model.joblib")
+    det.save(model_path)
+    assert not Path(model_path).exists()
+
+
+# ------------------------------------------------------------------
+# Tests : sécurité du dashboard (bind restreint + token) -- vrais appels
+# HTTP sur des serveurs réels démarrés le temps du test
+# ------------------------------------------------------------------
+def test_dashboard_default_binds_to_localhost_only():
+    state = ai_engine.DashboardState()
+    server = ai_engine.start_dashboard_server(state, port=0, bind_host="127.0.0.1", token=None)
+    try:
+        assert server.server_address[0] == "127.0.0.1"
+    finally:
+        server.shutdown()
+
+
+def test_dashboard_without_token_allows_open_access():
+    import urllib.request
+
+    state = ai_engine.DashboardState()
+    state.record_cycle({"1.1.1.1": {"pps": 10, "syn_ratio": 0.1, "udp_ratio": 0.01, "avg_pkt_size": 700}},
+                        entropy=1.0, blacklisted_since={}, simulated_since={}, ttl=60)
+    server = ai_engine.start_dashboard_server(state, port=0, bind_host="127.0.0.1", token=None)
+    port = server.server_address[1]
+    time.sleep(0.2)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=2) as resp:
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_dashboard_with_token_rejects_missing_or_wrong_token():
+    import urllib.request
+    import urllib.error
+
+    state = ai_engine.DashboardState()
+    server = ai_engine.start_dashboard_server(state, port=0, bind_host="127.0.0.1", token="secret123")
+    port = server.server_address[1]
+    time.sleep(0.2)
+    try:
+        for bad_url in (f"http://127.0.0.1:{port}/api/stats",
+                         f"http://127.0.0.1:{port}/api/stats?token=wrong"):
+            try:
+                urllib.request.urlopen(bad_url, timeout=2)
+                assert False, f"aurait dû être rejeté : {bad_url}"
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+    finally:
+        server.shutdown()
+
+
+def test_dashboard_with_token_accepts_correct_token():
+    import urllib.request
+
+    state = ai_engine.DashboardState()
+    server = ai_engine.start_dashboard_server(state, port=0, bind_host="127.0.0.1", token="secret123")
+    port = server.server_address[1]
+    time.sleep(0.2)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats?token=secret123", timeout=2) as resp:
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+
+
+# ------------------------------------------------------------------
 # Tests : dashboard temps réel (serveur HTTP réel, sur localhost)
 # ------------------------------------------------------------------
 def test_dashboard_state_snapshot_reflects_updates():

@@ -4,6 +4,10 @@
 // permettre à ai_engine.py de détecter des signatures d'attaque fines
 // (SYN flood, UDP flood, comportement distribué) au-delà d'un simple débit.
 //
+// Les tables utilisent le type LRU ("lru_hash") plutôt que "hash" fixe,
+// pour rester robustes sous une attaque réelle avec IP source usurpées en
+// masse (voir commentaire sur les BPF Maps ci-dessous).
+//
 // Ce fichier est compilé et chargé DYNAMIQUEMENT par ai_engine.py via bcc
 // (BPF(src_file="xdp_filter.c")) -- il n'est PAS compilé à part avec clang.
 
@@ -34,9 +38,17 @@ struct ip_stat_t {
 
 // ------------------------------------------------------------------
 // BPF Maps (macros BCC) partagées avec l'espace utilisateur
+//
+// Type "lru_hash" plutôt que "hash" standard : sous une attaque réelle
+// avec des IP source massivement usurpées (spoofing), une table de taille
+// fixe peut se remplir et rejeter silencieusement les nouvelles entrées
+// (bpf_map_update_elem échoue sans avertissement visible). Le type LRU
+// évince automatiquement les entrées les moins récemment utilisées,
+// garantissant que le système continue de fonctionner sous forte charge
+// plutôt que de "geler" une fois la table pleine.
 // ------------------------------------------------------------------
-BPF_HASH(blacklist, u32, u8, 65536);              // IP source -> 1 si bloquée
-BPF_HASH(ip_stats, u32, struct ip_stat_t, 65536); // IP source -> statistiques
+BPF_TABLE("lru_hash", u32, u8, blacklist, 65536);              // IP source -> 1 si bloquée
+BPF_TABLE("lru_hash", u32, struct ip_stat_t, ip_stats, 65536); // IP source -> statistiques
 
 // ------------------------------------------------------------------
 // Programme XDP principal

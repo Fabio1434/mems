@@ -98,6 +98,11 @@
 
 <script>
 const API = "/api/stats";
+const TOKEN = new URLSearchParams(window.location.search).get("token");
+function apiUrl() {
+  return TOKEN ? `${API}?token=${encodeURIComponent(TOKEN)}` : API;
+}
+
 const ipChart = new Chart(document.getElementById("ipChart"), {
   type: "bar",
   data: { labels: [], datasets: [{ label: "pps", data: [], backgroundColor: "#4da6ff" }] },
@@ -126,7 +131,12 @@ function fmtIn(ts) {
 
 async function refresh() {
   try {
-    const res = await fetch(API, { cache: "no-store" });
+    const res = await fetch(apiUrl(), { cache: "no-store" });
+    if (res.status === 401) {
+      document.getElementById("conn-status").className = "err";
+      document.getElementById("conn-status").textContent = "● token requis (?token=...)";
+      return;
+    }
     const data = await res.json();
     document.getElementById("conn-status").className = "ok";
     document.getElementById("conn-status").textContent = "● live";

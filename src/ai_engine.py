@@ -51,12 +51,18 @@ import struct
 import logging
 import threading
 import http.server
+import urllib.parse
 from pathlib import Path
 from collections import deque, defaultdict
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from bcc import BPF
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
 
 try:
     import yaml
@@ -75,6 +81,11 @@ DEFAULT_CONFIG = {
         "max_history_per_ip": 600,
         "retrain_interval_sec": 300,
         "poll_interval_sec": 2,
+        # Chemin de sauvegarde/chargement du modèle entraîné (joblib). Si
+        # renseigné, le modèle est rechargé au démarrage s'il existe déjà
+        # (évite de repartir de zéro -- et donc sans détection -- à chaque
+        # redémarrage), et resauvegardé après chaque entraînement.
+        "model_path": None,
     },
     "blacklist": {
         "ttl_sec": 60,
@@ -88,6 +99,16 @@ DEFAULT_CONFIG = {
     "dashboard": {
         "enabled": True,
         "port": 8080,
+        # Adresse d'écoute du serveur du dashboard. "127.0.0.1" par défaut
+        # (accessible uniquement depuis la machine elle-même) -- mettre
+        # "0.0.0.0" explicitement pour une démonstration nécessitant un
+        # accès depuis un autre poste sur le réseau.
+        "bind_host": "127.0.0.1",
+        # Jeton optionnel requis (paramètre ?token=... dans l'URL) pour
+        # accéder au dashboard et à l'API. Laisser vide/null pour désactiver
+        # (à éviter en dehors d'un lab isolé -- le dashboard expose du
+        # trafic réseau en clair sans ce jeton).
+        "token": None,
     },
 }
 
@@ -297,6 +318,39 @@ class TrafficAnomalyDetector:
             return False
         return (now - self.last_train_time) >= interval_sec
 
+    def save(self, path: str):
+        """Sauvegarde le modèle entraîné sur disque (joblib). Ne sauvegarde
+        PAS l'historique de features (recalculé naturellement au fil du
+        trafic après redémarrage) -- seulement le modèle scikit-learn."""
+        if joblib is None:
+            log.warning("joblib n'est pas installé -- impossible de sauvegarder le modèle (pip3 install joblib)")
+            return
+        if not self.is_trained:
+            return
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self.model, path)
+        log.info("Modèle sauvegardé sur %s", path)
+
+    def load(self, path: str) -> bool:
+        """Charge un modèle précédemment sauvegardé. Retourne True si le
+        chargement a réussi. Permet d'éviter une fenêtre de vulnérabilité
+        (aucune détection possible) le temps de réaccumuler un historique
+        après un redémarrage."""
+        if joblib is None:
+            log.warning("joblib n'est pas installé -- impossible de charger le modèle (pip3 install joblib)")
+            return False
+        if not Path(path).exists():
+            return False
+        try:
+            self.model = joblib.load(path)
+            self.is_trained = True
+            self.last_train_time = time.time()
+            log.info("Modèle chargé depuis %s (ré-entraînement périodique toujours actif)", path)
+            return True
+        except Exception as e:
+            log.warning("Échec du chargement du modèle depuis %s : %s", path, e)
+            return False
+
     def _feature_means(self) -> np.ndarray:
         samples = [row for values in self.feature_history.values() for row in values]
         if not samples:
@@ -369,12 +423,28 @@ class DashboardState:
             }
 
 
-def make_dashboard_handler(state: DashboardState):
+def make_dashboard_handler(state: DashboardState, token: str = None):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(DASHBOARD_DIR), **kwargs)
 
+        def _token_ok(self) -> bool:
+            if not token:
+                return True
+            query = urllib.parse.urlparse(self.path).query
+            provided = urllib.parse.parse_qs(query).get("token", [None])[0]
+            return provided == token
+
         def do_GET(self):
+            if not self._token_ok():
+                body = b"401 Unauthorized -- token manquant ou invalide (?token=...)"
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if self.path.startswith("/api/stats"):
                 payload = json.dumps(state.snapshot()).encode("utf-8")
                 self.send_response(200)
@@ -392,12 +462,16 @@ def make_dashboard_handler(state: DashboardState):
     return Handler
 
 
-def start_dashboard_server(state: DashboardState, port: int):
-    handler = make_dashboard_handler(state)
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+def start_dashboard_server(state: DashboardState, port: int, bind_host: str = "127.0.0.1", token: str = None):
+    handler = make_dashboard_handler(state, token=token)
+    server = http.server.ThreadingHTTPServer((bind_host, port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info("Dashboard temps réel disponible sur http://<ip-du-routeur>:%d", port)
+    suffix = f"?token={token}" if token else ""
+    log.info("Dashboard temps réel disponible sur http://%s:%d%s", bind_host, port, suffix)
+    if bind_host == "0.0.0.0":
+        log.warning("Dashboard exposé sur toutes les interfaces (0.0.0.0) -- "
+                     "assurez-vous qu'un token est configuré si ce réseau n'est pas isolé.")
     return server
 
 
@@ -425,12 +499,15 @@ def build_settings(args) -> dict:
         "retrain_interval": retrain_interval,
         "dashboard_port": dashboard_port,
         "dashboard_enabled": dashboard_enabled,
+        "dashboard_bind_host": config["dashboard"]["bind_host"],
+        "dashboard_token": config["dashboard"]["token"],
         "dry_run": dry_run,
         "whitelist": whitelist,
         "contamination": config["detection"]["contamination"],
         "training_window": config["detection"]["training_window"],
         "max_history_per_ip": config["detection"]["max_history_per_ip"],
         "poll_interval": config["detection"]["poll_interval_sec"],
+        "model_path": config["detection"].get("model_path"),
         "entropy_history_size": config["entropy"]["history_size"],
         "entropy_spike_threshold": config["entropy"]["spike_threshold"],
     }
@@ -450,9 +527,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                          help="Force le mode simulation : détecte et journalise, ne bloque JAMAIS "
                               "(s'ajoute au réglage du fichier de config, ne le désactive pas)")
+    parser.add_argument("--model-path", default=None,
+                         help="Chemin de sauvegarde/chargement du modèle entraîné (joblib)")
     args = parser.parse_args()
 
     settings = build_settings(args)
+    if args.model_path is not None:
+        settings["model_path"] = args.model_path
 
     log.info("Démarrage -- iface=%s, TTL=%ds, ré-entraînement=%ds, DRY-RUN=%s, whitelist=%d IP(s)",
               settings["iface"], settings["ttl"], settings["retrain_interval"],
@@ -466,6 +547,10 @@ def main():
         training_window=settings["training_window"],
         max_history_per_ip=settings["max_history_per_ip"],
     )
+    if settings["model_path"]:
+        if detector.load(settings["model_path"]):
+            log.info("Détection immédiatement active grâce au modèle rechargé (pas d'attente de %d échantillons)",
+                      settings["training_window"])
     entropy_monitor = EntropyMonitor(
         history_size=settings["entropy_history_size"],
         spike_threshold=settings["entropy_spike_threshold"],
@@ -474,7 +559,11 @@ def main():
     state = DashboardState()
     state.set_mode(settings["dry_run"], settings["whitelist"])
     if settings["dashboard_enabled"]:
-        start_dashboard_server(state, settings["dashboard_port"])
+        start_dashboard_server(
+            state, settings["dashboard_port"],
+            bind_host=settings["dashboard_bind_host"],
+            token=settings["dashboard_token"],
+        )
 
     csv_writer, csv_file = None, None
     if args.log_csv:
@@ -499,10 +588,14 @@ def main():
 
             if not detector.is_trained and detector.ready_to_train():
                 detector.train()
+                if settings["model_path"]:
+                    detector.save(settings["model_path"])
                 state.add_alert("info", "Modèle initial entraîné")
 
             if detector.due_for_retrain(start, settings["retrain_interval"]):
                 detector.train()
+                if settings["model_path"]:
+                    detector.save(settings["model_path"])
                 state.add_alert("info", "Modèle ré-entraîné (fenêtre glissante mise à jour)")
 
             anomalies = detector.detect(features) if detector.is_trained else {}

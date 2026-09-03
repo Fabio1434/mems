@@ -36,6 +36,13 @@ detection:
   # Fréquence (en secondes) de lecture des BPF Maps.
   poll_interval_sec: 2
 
+  # Chemin de sauvegarde/chargement du modèle entraîné (joblib). Si
+  # renseigné, le modèle est rechargé au démarrage s'il existe déjà --
+  # évite une fenêtre de vulnérabilité (aucune détection possible) le
+  # temps de réaccumuler 150 échantillons après chaque redémarrage.
+  # Laisser `null` pour repartir de zéro à chaque démarrage.
+  model_path: null   # ex: "models/mon-environnement.joblib"
+
 blacklist:
   # Durée (en secondes) avant déblocage automatique d'une IP blacklistée.
   ttl_sec: 60
@@ -66,3 +73,16 @@ entropy:
 dashboard:
   enabled: true
   port: 8080
+
+  # Adresse d'écoute du serveur du dashboard. "127.0.0.1" = accessible
+  # uniquement depuis la machine elle-même (recommandé par défaut).
+  # Mettre "0.0.0.0" UNIQUEMENT si un accès depuis un autre poste est
+  # nécessaire (ex: démonstration en salle) -- et alors renseigner
+  # impérativement un `token` ci-dessous.
+  bind_host: "127.0.0.1"
+
+  # Jeton requis pour accéder au dashboard (URL : http://host:port/?token=...).
+  # Laisser `null` désactive la vérification -- à éviter si bind_host
+  # n'est pas "127.0.0.1", car le dashboard expose alors le trafic réseau
+  # en clair à quiconque atteint le port.
+  token: null   # ex: "un-secret-a-changer"

@@ -53,11 +53,11 @@ Un botnet qui répartit une attaque sur des milliers d'IP, chacune sous le seuil
 
 **c) Ré-entraînement périodique (concept drift)**
 
-Un modèle entraîné une seule fois au démarrage ne s'adapte jamais à l'évolution naturelle du trafic (heures de pointe, nouveaux usages). `ai_engine.py` maintient un historique de features en **fenêtre glissante** par IP (`MAX_HISTORY_PER_IP = 600` échantillons, borné via `collections.deque`) et **ré-entraîne le modèle périodiquement** (`--retrain-interval`, 5 min par défaut) sur cette fenêtre récente plutôt que sur tout l'historique depuis le démarrage.
+Un modèle entraîné une seule fois au démarrage ne s'adapte jamais à l'évolution naturelle du trafic (heures de pointe, nouveaux usages). `ai_engine.py` maintient un historique de features en **fenêtre glissante** par IP (`max_history_per_ip`, borné via `collections.deque`) et **ré-entraîne le modèle périodiquement** (`--retrain-interval` ou `detection.retrain_interval_sec`, 5 min par défaut) sur cette fenêtre récente plutôt que sur tout l'historique depuis le démarrage.
 
 **d) Détection UDP flood**
 
-En plus du `syn_ratio` (SYN flood), le système calcule un `udp_ratio` par IP (proportion de paquets UDP), directement en lien avec le vecteur d'attaque "SYN/UDP Flood" mentionné dans le cahier des charges initial. Un flood UDP à débit quasi-normal mais avec un `udp_ratio` très atypique est détecté par le modèle multi-dimensionnel (voir `tests/test_ai_engine_logic.py::test_detector_flags_stealthy_udp_flood_via_udp_ratio`).
+En plus du `syn_ratio` (SYN flood), le système calcule un `udp_ratio` par IP (proportion de paquets UDP), directement en lien avec le vecteur d'attaque "SYN/UDP Flood" mentionné dans le cahier des charges initial.
 
 **e) Dashboard web temps réel**
 
@@ -65,9 +65,28 @@ En plus du `syn_ratio` (SYN flood), le système calcule un `udp_ratio` par IP (p
 - `GET /` — le dashboard (`dashboard/index.html`) : trafic par IP, graphe d'entropie, blacklist en direct, flux d'alertes
 - `GET /api/stats` — un snapshot JSON de l'état courant, rafraîchi côté client toutes les 1.5s
 
-Accessible sur `http://<ip-du-routeur>:8080` (port configurable via `--dashboard-port`, désactivable via `--no-dashboard`). Pensé pour la **démonstration en direct** demandée dans le cahier des charges : l'attaque et son blocage sont visibles en temps réel, sans dépendre de la lecture de logs texte.
+Accessible sur `http://<ip-du-routeur>:8080` par défaut (voir section 8 pour la configuration de sécurité de l'accès).
 
-## 4. Structure du dépôt
+## 4. Robustesse pour un déploiement réel (au-delà du lab de démonstration)
+
+Un PoC de soutenance et un outil qu'on peut réellement tester sur un réseau ont des exigences différentes. Ces mécanismes comblent l'écart :
+
+**a) Maps BPF en LRU (résistance à la saturation sous attaque réelle)**
+
+`blacklist` et `ip_stats` utilisent le type `lru_hash` plutôt que `hash` standard. Sous une vraie attaque avec des IP source massivement usurpées, une table de taille fixe peut se remplir et rejeter silencieusement les nouvelles entrées. Le type LRU évince automatiquement les entrées les moins récemment utilisées -- le système continue de fonctionner sous forte charge plutôt que de "geler" silencieusement.
+
+**b) Persistance du modèle entre redémarrages**
+
+Sans persistance, chaque redémarrage repart de zéro : il faut réaccumuler `training_window` échantillons (150 par défaut, ~5 min à 2s/cycle) avant la première détection -- une fenêtre de vulnérabilité à chaque redémarrage. En renseignant `detection.model_path` dans la config, le modèle entraîné est sauvegardé (`joblib`) après chaque entraînement et rechargé automatiquement au démarrage : la détection est immédiatement active, même juste après un redémarrage.
+
+**c) Sécurisation du dashboard**
+
+Le dashboard expose des données de trafic réseau en temps réel -- sans protection, n'importe qui atteignant le port peut les consulter. Deux mécanismes indépendants :
+- `dashboard.bind_host` : `"127.0.0.1"` par défaut (accessible uniquement depuis la machine elle-même). Mettre `"0.0.0.0"` explicitement seulement si un accès distant est nécessaire (ex: démonstration en salle).
+- `dashboard.token` : si renseigné, chaque requête doit inclure `?token=...` dans l'URL, sinon `401 Unauthorized`. À utiliser systématiquement si `bind_host` n'est pas `"127.0.0.1"`.
+
+
+## 5. Structure du dépôt
 
 ```
 lab/
@@ -85,7 +104,11 @@ dashboard/
 config/
   example.yaml             Modèle de fichier de configuration (à copier et
                           adapter par environnement testé -- interface,
-                          whitelist, dry-run, seuils)
+                          whitelist, dry-run, seuils, sécurité dashboard)
+models/
+  (généré)                 Modèles entraînés sauvegardés (joblib), un par
+                          environnement -- non versionné (voir .gitignore),
+                          activé via detection.model_path dans la config
 scripts/
   run_benchmark.sh        Génère trafic légitime (iperf3) + attaque (hping3),
                           mesure CPU et latence, en mode baseline ou protected
@@ -101,7 +124,7 @@ requirements.txt          Dépendances Python (scikit-learn, numpy, pandas,
                           matplotlib, pytest)
 ```
 
-## 5. Prérequis
+## 6. Prérequis
 
 - Machine Linux (kernel 5.15+), Ubuntu 22.04/24.04 recommandé
 - [Docker](https://docs.docker.com/engine/install/)
@@ -110,7 +133,7 @@ requirements.txt          Dépendances Python (scikit-learn, numpy, pandas,
 
 > ⚠️ **bcc et les headers noyau** : `ai_engine.py` compile `xdp_filter.c` à l'exécution via `bcc`, qui a besoin des headers du noyau de la machine **hôte** (les conteneurs partagent ce noyau). Si l'installation de `linux-headers-$(uname -r)` échoue dans le conteneur `xdp-router`, monter `/usr/src` et `/lib/modules` de l'hôte en bind read-only dans `lab/topology.clab.yaml`.
 
-## 6. Installation et déploiement du lab
+## 7. Installation et déploiement du lab
 
 ```bash
 git clone https://github.com/Fabio1434/mems.git
@@ -124,7 +147,7 @@ sudo containerlab deploy -t lab/topology.clab.yaml
 sudo docker exec -it clab-xdp-ai-lab-attacker ping -c 3 10.0.3.2
 ```
 
-## 7. Configuration par environnement (fichier config.yaml)
+## 8. Configuration par environnement (fichier config.yaml)
 
 Pour tester ce système sur un réseau réel (pas seulement le lab de développement), **ne pas modifier le code** -- créer un fichier de configuration dédié à cet environnement :
 
@@ -156,7 +179,7 @@ blacklist:
 
 Les IP de la whitelist ne sont **jamais** bloquées, même si le modèle les juge anormales. À renseigner systématiquement pour toute IP dont le blocage aurait un impact critique (passerelle, DNS, sondes de supervision, IP de management).
 
-## 8. Lancer la protection (XDP + IA)
+## 9. Lancer la protection (XDP + IA)
 
 Depuis le conteneur `xdp-router` :
 
@@ -179,6 +202,7 @@ Le script attache le programme XDP sur `eth1` (interface côté attaquant), puis
 | `--config <fichier>` | Fichier YAML de configuration (voir section 6) |
 | `--iface <if>` | Interface où attacher le programme XDP (obligatoire si absent du fichier de config) |
 | `--dry-run` | Force le mode simulation (détecte, ne bloque jamais) |
+| `--model-path <fichier>` | Sauvegarde/charge le modèle entraîné entre redémarrages (joblib) |
 | `--ttl <sec>` | Durée avant déblocage automatique d'une IP (défaut : 60s) |
 | `--retrain-interval <sec>` | Intervalle de ré-entraînement périodique du modèle (défaut : 300s) |
 | `--dashboard-port <port>` | Port du dashboard web temps réel (défaut : 8080) |
@@ -207,7 +231,7 @@ ip link set dev eth1 xdp off
 
 > **Note sur `TRAINING_WINDOW`** : fixé empiriquement à 150 échantillons (voir tests). Avec un historique d'entraînement trop court (testé à 30), l'Isolation Forest manque de données pour bien séparer les anomalies subtiles (SYN flood furtif à débit quasi-normal) -- un point à documenter dans le rapport si vous ajustez cette valeur.
 
-## 9. Tests unitaires
+## 10. Tests unitaires
 
 La logique métier (conversion IP, calcul du débit, détection d'anomalies) est testable **sans bcc/eBPF** (donc sans machine Linux privilégiée), via un mock du module `bcc` :
 
@@ -218,7 +242,7 @@ pytest tests/test_ai_engine_logic.py -v
 
 > **Limitation connue** : avec le paramètre `contamination` par défaut (0.05), le modèle Isolation Forest peut occasionnellement flaguer une IP légitime en même temps qu'un flood massif, si son débit s'écarte un peu de la distribution d'entraînement. Ce paramètre est à calibrer sur un jeu de trafic réel représentatif avant la démonstration finale -- c'est un point à documenter dans le rapport (compromis faux positifs / faux négatifs).
 
-## 10. Lancer les benchmarks
+## 11. Lancer les benchmarks
 
 ```bash
 cd scripts/
@@ -237,7 +261,7 @@ Résultats produits dans `scripts/benchmark_results/` :
 - `baseline/` et `protected/` — CSV bruts (CPU, latence, résumé de trafic)
 - `graphs/` — `cpu_comparison.png`, `latency_comparison.png`, `packets_comparison.png`
 
-## 11. Outils de génération de trafic et d'analyse
+## 12. Outils de génération de trafic et d'analyse
 
 | Outil | Usage |
 |---|---|
@@ -248,18 +272,19 @@ Résultats produits dans `scripts/benchmark_results/` :
 | `tcpdump` | Capture de paquets pour validation |
 | `htop` / `perf` | Analyse de charge CPU du routeur |
 
-## 12. Livrables du mémoire
+## 13. Livrables du mémoire
 
-- [x] `xdp_filter.c` — programme noyau eBPF/XDP (TCP + UDP)
-- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps (TTL, dashboard, config, dry-run, whitelist)
+- [x] `xdp_filter.c` — programme noyau eBPF/XDP (TCP + UDP, maps LRU)
+- [x] `ai_engine.py` — moteur de détection IA + gestion des BPF Maps (TTL, dashboard, config, dry-run, whitelist, persistance)
 - [x] `topology.clab.yaml` — infrastructure de test
-- [x] Tests unitaires de la logique de détection (33 tests)
-- [x] Dashboard temps réel pour la démonstration en direct
+- [x] Tests unitaires de la logique de détection (40 tests)
+- [x] Dashboard temps réel pour la démonstration en direct (sécurisé : bind restreint + token)
 - [x] Fichier de configuration par environnement + mode simulation (dry-run) pour un déploiement sûr sur un réseau réel
+- [x] Robustesse sous charge réelle (maps LRU) + persistance du modèle entre redémarrages
 - [ ] Dossier d'évaluation des performances (graphiques comparatifs) — à générer après exécution des benchmarks sur le lab réel
 - [ ] Rapport de mémoire complet (état de l'art, conception, implémentation, résultats)
 - [ ] Démonstration en direct devant le jury
 
-## 13. Auteur
+## 14. Auteur
 
 Fabio — Master 2 Télécommunications & Cybersécurité

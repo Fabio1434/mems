@@ -12,6 +12,10 @@ scripts/benchmark_results/
 config/*.yaml
 !config/example.yaml
 
+# Modèles entraînés sauvegardés (spécifiques à un déploiement, volumineux)
+models/
+*.joblib
+
 # Logs
 *.log
 
